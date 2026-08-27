@@ -150,7 +150,9 @@ def build_property(row: dict) -> dict:
         owner["company"] = last
     body = {"address": addr, "owner": owner}
     if row.get("Lists"):
-        body["lists"] = row["Lists"]
+        # ARRAY, not a comma string -- same trap as Tags below. Never
+        # triggered before because every prior caller sent exactly one list.
+        body["lists"] = [l.strip() for l in row["Lists"].split(",") if l.strip()]
     if row.get("Tags"):
         # ARRAY, not a comma string
         body["tags"] = [t.strip() for t in row["Tags"].split(",") if t.strip()]
