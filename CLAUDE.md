@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
+**Operating company: National Houses ([nationalhouses.com](https://nationalhouses.com/)), "Find Your Best Option."** A real estate cash-buying company — fair cash offers within 24 hours, closing in as little as a week, no repairs or showings — serving sellers facing foreclosure, landlords done with bad tenants, and families who inherited a property they don't want to keep. SiftStack is the internal operations platform National Houses runs its acquisitions, market intelligence, and lead-management pipeline on. When a skill or script needs a company name, tagline, or brand voice, this is it — never fabricate a different company name.
+
 **SiftStack** — Full-stack real estate investing operations platform built around DataSift.ai CRM. Covers the entire REI business lifecycle:
 
 1. **Data Acquisition:** Web scraping tnpublicnotice.com (foreclosures, tax sales, probates), scanned PDF import, courthouse terminal photo import (probate, eviction, code violations, divorce), Dropbox auto-polling
