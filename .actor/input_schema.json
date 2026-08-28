@@ -158,7 +158,14 @@
         "slack_webhook_url": {
             "title": "Slack/Discord Webhook URL",
             "type": "string",
-            "description": "Webhook URL for run summary notifications. Works with Slack incoming webhooks or Discord /slack endpoints. Optional.",
+            "description": "Webhook URL for run summary notifications. Works with Slack incoming webhooks or Discord /slack endpoints. Optional. Ignored when google_chat_webhook_url is also set.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "google_chat_webhook_url": {
+            "title": "Google Chat Webhook URL",
+            "type": "string",
+            "description": "Google Chat space webhook URL for run summary notifications. Takes priority over slack_webhook_url when both are set. Optional.",
             "editor": "textfield",
             "isSecret": true
         },

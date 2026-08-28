@@ -12,6 +12,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def env(key: str, default: str = "") -> str:
+    """os.getenv, but a key that EXISTS with a blank value still gets the default.
+
+    os.getenv only falls back when the key is absent, so a `KEY=` line left in
+    .env returns "" and defeats every default below. That is silent for strings
+    and fatal for the numeric ones: a blank DROPBOX_POLL_INTERVAL made int("")
+    raise at import and took down the whole `python src/main.py` CLI.
+    """
+    return (os.getenv(key) or "").strip() or default
+
 # ── Run date / timezone ────────────────────────────────────────────────
 # Stamp date_added (and other "today" values) in the operator's business
 # timezone, not the server clock. The Apify cloud container runs in UTC, so a
@@ -52,7 +63,7 @@ DROPBOX_STATE_FILE = STATE_DIR / "dropbox_state.json"
 PHOTO_STATE_FILE = STATE_DIR / "photo_state.json"
 
 # ── Dropbox Watcher ────────────────────────────────────────────────────
-DROPBOX_POLL_INTERVAL = int(os.getenv("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)
+DROPBOX_POLL_INTERVAL = int(env("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)
 DROPBOX_ROOT_FOLDER = os.getenv("DROPBOX_ROOT_FOLDER", "")  # root folder path in Dropbox, e.g. "/TN Public Notice"
 DROPBOX_STORAGE_WARN_PERCENT = 80  # warn when storage usage exceeds this %
 
@@ -94,7 +105,7 @@ TRESTLE_API_KEY = os.getenv("TRESTLE_API_KEY", "")            # Trestle phone va
 # treated as PAID (set TRESTLE_LEGACY_IS_FREE=1 to treat it as the free key instead).
 TRESTLE_FREE_API_KEY = os.getenv("TRESTLE_FREE_API_KEY", "")  # affiliate free-allotment key (1,000 free)
 TRESTLE_PAID_API_KEY = os.getenv("TRESTLE_PAID_API_KEY", "")  # billed key (used after free is exhausted)
-TRESTLE_FREE_LIMIT = int(os.getenv("TRESTLE_FREE_LIMIT", "1000"))   # size of the free allotment
+TRESTLE_FREE_LIMIT = int(env("TRESTLE_FREE_LIMIT", "1000"))   # size of the free allotment
 TRESTLE_FREE_RESET = os.getenv("TRESTLE_FREE_RESET", "cumulative")  # "cumulative" (one-time) or "monthly"
 ENFORMION_AP_NAME = os.getenv("ENFORMION_AP_NAME", "")        # Enformion/Endato API access profile name
 ENFORMION_AP_PASSWORD = os.getenv("ENFORMION_AP_PASSWORD", "")  # Enformion/Endato API access profile password
@@ -102,6 +113,7 @@ SCRAPFLY_KEY = os.getenv("SCRAPFLY_KEY", "")                  # Scrapfly web scr
 DATASIFT_EMAIL = os.getenv("DATASIFT_EMAIL", "")              # DataSift.ai login
 DATASIFT_PASSWORD = os.getenv("DATASIFT_PASSWORD", "")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")        # Slack/Discord webhook
+GOOGLE_CHAT_WEBHOOK_URL = os.getenv("GOOGLE_CHAT_WEBHOOK_URL", "")  # Google Chat webhook (preferred over Slack when both are set)
 ANCESTRY_EMAIL = os.getenv("ANCESTRY_EMAIL", "")              # Ancestry.com login
 ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 app key
@@ -183,13 +195,13 @@ RESULTS_PER_PAGE = 50  # max the site allows
 # shell. Until the full in-session flow is built, default stays "playwright".
 SCRAPE_BACKEND = os.getenv("SCRAPE_BACKEND", "playwright").strip().lower()
 SCRAPFLY_COUNTRY = os.getenv("SCRAPFLY_COUNTRY", "us")          # proxy geolocation for Scrapfly
-SCRAPFLY_RENDER_WAIT_MS = int(os.getenv("SCRAPFLY_RENDER_WAIT_MS", "3500"))  # wait after View Notice click
-SCRAPFLY_TIMEOUT_MS = int(os.getenv("SCRAPFLY_TIMEOUT_MS", "90000"))         # per-call ceiling
-SCRAPFLY_MAX_RETRIES = int(os.getenv("SCRAPFLY_MAX_RETRIES", "2"))           # extra attempts on gate/CAPTCHA miss
+SCRAPFLY_RENDER_WAIT_MS = int(env("SCRAPFLY_RENDER_WAIT_MS", "3500"))  # wait after View Notice click
+SCRAPFLY_TIMEOUT_MS = int(env("SCRAPFLY_TIMEOUT_MS", "90000"))         # per-call ceiling
+SCRAPFLY_MAX_RETRIES = int(env("SCRAPFLY_MAX_RETRIES", "2"))           # extra attempts on gate/CAPTCHA miss
 SCRAPFLY_PROXY_POOL = os.getenv("SCRAPFLY_PROXY_POOL", "public_residential_pool")  # residential proxies for the generic ASP fallback fetcher (scrapfly_browser)
 
 # ── Image Processing ───────────────────────────────────────────────────
-BLUR_THRESHOLD = int(os.getenv("BLUR_THRESHOLD", "100"))   # Laplacian variance; below = rejected as blurry
+BLUR_THRESHOLD = int(env("BLUR_THRESHOLD", "100"))   # Laplacian variance; below = rejected as blurry
 TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
 TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best for terminal screen photos
 

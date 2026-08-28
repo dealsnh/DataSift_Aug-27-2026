@@ -428,7 +428,7 @@ def _summary_text(run: RunResult) -> str:
 
 
 def _notify(run: RunResult) -> None:
-    if not config.SLACK_WEBHOOK_URL:
+    if not (config.SLACK_WEBHOOK_URL or config.GOOGLE_CHAT_WEBHOOK_URL):
         return
     try:
         from slack_notifier import _send_webhook

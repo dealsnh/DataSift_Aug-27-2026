@@ -165,6 +165,7 @@ async def actor_main() -> None:
             "DATASIFT_EMAIL": actor_input.get("datasift_email", ""),
             "DATASIFT_PASSWORD": actor_input.get("datasift_password", ""),
             "SLACK_WEBHOOK_URL": actor_input.get("slack_webhook_url", ""),
+            "GOOGLE_CHAT_WEBHOOK_URL": actor_input.get("google_chat_webhook_url", ""),
             "TRESTLE_API_KEY": actor_input.get("trestle_api_key", ""),
         }
         for key, val in _cred_map.items():
@@ -377,11 +378,13 @@ async def actor_main() -> None:
                     "STALE RUN: 0 notices scraped. The upstream source is "
                     "unreachable or its gate changed. Not a normal empty day."
                 )
-                if do_notify_slack and config.SLACK_WEBHOOK_URL:
+                if do_notify_slack and (config.SLACK_WEBHOOK_URL or config.GOOGLE_CHAT_WEBHOOK_URL):
                     try:
                         from slack_notifier import _send_webhook
+                        # NOTE: was previously called as (url, text) -- backwards from
+                        # _send_webhook's (text, webhook_url) signature, so this alert
+                        # silently failed (tried to POST to the message text as a URL).
                         _send_webhook(
-                            config.SLACK_WEBHOOK_URL,
                             ":rotating_light: *SiftStack scrape produced ZERO notices*\n"
                             "Searches ran and completed, but nothing was captured. "
                             "This is how the scrape sat broken for 19 days in July 2026 "
@@ -617,7 +620,7 @@ async def actor_main() -> None:
             # Remove zero-cost entries for cleaner display
             cost_breakdown = {k: v for k, v in cost_breakdown.items() if v > 0}
 
-            if do_notify_slack and config.SLACK_WEBHOOK_URL:
+            if do_notify_slack and (config.SLACK_WEBHOOK_URL or config.GOOGLE_CHAT_WEBHOOK_URL):
                 try:
                     from slack_notifier import (
                         send_slack_notification, send_record_package, _send_webhook,
@@ -1392,7 +1395,7 @@ def cli_main() -> None:
     parser.add_argument(
         "--notify-slack",
         action="store_true",
-        help="Send run summary to Slack/Discord webhook (requires SLACK_WEBHOOK_URL)",
+        help="Send run summary to Slack/Discord/Google Chat webhook (requires SLACK_WEBHOOK_URL or GOOGLE_CHAT_WEBHOOK_URL)",
     )
     parser.add_argument(
         "--audit-records",

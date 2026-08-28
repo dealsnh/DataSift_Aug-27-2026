@@ -1,10 +1,16 @@
-"""Send run summary notifications to Slack or Discord via webhook.
+"""Send run summary notifications to Slack, Discord, or Google Chat via webhook.
 
-Works with both Slack incoming webhooks and Discord webhooks (using the
-/slack compatibility endpoint). Set SLACK_WEBHOOK_URL in .env.
+Works with Slack incoming webhooks, Discord webhooks (using the /slack
+compatibility endpoint), and Google Chat space webhooks. Set
+GOOGLE_CHAT_WEBHOOK_URL in .env for Google Chat -- it's checked first and
+takes priority over SLACK_WEBHOOK_URL when both are set, so an operator can
+switch channels without touching any call site in main.py/ftm_runner.py.
 
 Discord webhook URLs should use the /slack suffix:
   https://discord.com/api/webhooks/{id}/{token}/slack
+
+Google Chat webhook URLs look like:
+  https://chat.googleapis.com/v1/spaces/{space}/messages?key=...&token=...
 """
 
 import json
@@ -27,18 +33,31 @@ def _is_discord(webhook_url: str) -> bool:
     return "discord.com" in (webhook_url or "")
 
 
+def _is_google_chat(webhook_url: str) -> bool:
+    return "chat.googleapis.com" in (webhook_url or "")
+
+
+def _default_webhook_url() -> str:
+    """Google Chat takes priority when both are configured -- see module docstring."""
+    return (
+        os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
+        or os.environ.get("SLACK_WEBHOOK_URL", "")
+    )
+
+
 def _send_webhook(text: str, webhook_url: str | None = None, blocks: list | None = None) -> bool:
-    """Send a message to the configured Slack/Discord webhook.
+    """Send a message to the configured Slack/Discord/Google Chat webhook.
 
     blocks (Slack Block Kit, e.g. inline image blocks) are attached when provided
-    and the target is Slack. Discord's /slack compatibility endpoint ignores
-    blocks, so callers fall back to text links there.
+    and the target is Slack. Discord's /slack compatibility endpoint and Google
+    Chat's basic text messages both ignore Block Kit, so callers fall back to
+    text links there.
     """
-    webhook_url = webhook_url or os.environ.get("SLACK_WEBHOOK_URL", "")
+    webhook_url = webhook_url or _default_webhook_url()
     if not webhook_url:
         return False
     payload: dict = {"text": text}
-    if blocks and not _is_discord(webhook_url):
+    if blocks and not _is_discord(webhook_url) and not _is_google_chat(webhook_url):
         payload["blocks"] = blocks
     for attempt in range(2):
         try:
@@ -333,9 +352,9 @@ def send_slack_notification(
     Returns:
         True if notification sent successfully.
     """
-    webhook_url = webhook_url or os.environ.get("SLACK_WEBHOOK_URL", "")
+    webhook_url = webhook_url or _default_webhook_url()
     if not webhook_url:
-        logger.warning("No SLACK_WEBHOOK_URL set, skipping notification")
+        logger.warning("No GOOGLE_CHAT_WEBHOOK_URL or SLACK_WEBHOOK_URL set, skipping notification")
         return False
 
     text = build_summary(
@@ -427,14 +446,14 @@ def send_record_package(
     can't spam the channel; the full list is always in the CSV. Paces sends ~1/s
     to respect Slack webhook rate limits. Returns True if every batch sent.
     """
-    webhook_url = webhook_url or os.environ.get("SLACK_WEBHOOK_URL", "")
+    webhook_url = webhook_url or _default_webhook_url()
     if not webhook_url or not notices:
         return False
     recs = list(notices)
     total = len(recs)
     overflow = max(0, total - max_records)
     recs = recs[:max_records]
-    discord = _is_discord(webhook_url)
+    discord = _is_discord(webhook_url) or _is_google_chat(webhook_url)  # both are text-only, no Block Kit
     ok = True
     sent_any = False
     for i in range(0, len(recs), batch_size):
