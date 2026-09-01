@@ -22,6 +22,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -126,6 +127,70 @@ def field_index(api: Api) -> dict:
     return out
 
 
+def _notify(rows: list, created: int, existing: int, fielded: int, failed: int,
+            secs: float, label: str = "") -> None:
+    """Post a run summary to Google Chat / Slack. Best effort, never fatal.
+
+    Wired HERE rather than in each pipeline so every DataSift upload reports
+    itself. The OC probate run went out with no notification at all because the
+    only callers of slack_notifier were main.py and dropbox_watcher, and
+    send_slack_notification() takes NoticeData objects that an API-CSV upload
+    never builds.
+    """
+    if (os.getenv("SIFTSTACK_NO_NOTIFY") or "").strip():
+        return
+    try:
+        from slack_notifier import _send_webhook, _default_webhook_url
+        if not _default_webhook_url():
+            return
+
+        lists, tags = {}, {}
+        for r in rows:
+            for l in (r.get("Lists") or "").split(","):
+                if l.strip():
+                    lists[l.strip()] = lists.get(l.strip(), 0) + 1
+            for t in (r.get("Tags") or "").split(","):
+                t = t.strip()
+                if t and not t.startswith(("pulled_", "20")):
+                    tags[t] = tags.get(t, 0) + 1
+
+        ok = created + existing
+        head = "DataSift upload" + (f" - {label}" if label else "")
+        lines = [
+            f"*{head}*",
+            f"{ok} of {len(rows)} records in  (new {created}, already existed {existing})",
+            f"custom fields set: {fielded}   failed: {failed}   took {secs/60:.1f} min",
+        ]
+        if lists:
+            lines.append("lists: " + ", ".join(f"{k} ({v})" for k, v in
+                                               sorted(lists.items(), key=lambda x: -x[1])))
+        top = sorted(tags.items(), key=lambda x: -x[1])[:8]
+        if top:
+            lines.append("tags: " + ", ".join(f"{k} ({v})" for k, v in top))
+        if failed:
+            lines.append(f"WARNING: {failed} record(s) failed - see output/upload_errors.txt")
+        _send_webhook("\n".join(lines))
+    except Exception as e:                      # noqa: BLE001
+        print("  notification skipped: %s" % str(e)[:140])
+
+
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _existing_uuid(exc: Exception) -> str:
+    """Pull the existing property uuid out of an 'address already exists' 400.
+
+    The body looks like:
+      {"non_field_errors":["Property address already exists!"],
+       "property":["b3a1bca5-0804-442a-b02f-672d7f6cfb2c"]}
+    """
+    text = str(exc)
+    if "already exists" not in text.lower():
+        return ""
+    m = _UUID_RE.search(text)
+    return m.group(0) if m else ""
+
+
 def build_property(row: dict) -> dict:
     addr = {"street": row["Property Street Address"],
             "city": row.get("Property City") or "",
@@ -181,7 +246,8 @@ def field_pairs(row: dict, idx: dict, warn: set) -> list[dict]:
 
 
 def upload_rows(rows: list[dict], *, commit: bool = False,
-                sleep: float = 0.1, out_dir: str = "output") -> dict:
+                sleep: float = 0.1, out_dir: str = "output",
+                notify_label: str = "") -> dict:
     """Push rows into DataSift. Returns counts so a caller can act on them.
 
     Broken out of main() so the scheduled runner can call it in-process and
@@ -193,7 +259,7 @@ def upload_rows(rows: list[dict], *, commit: bool = False,
           % ("COMMIT" if commit else "DRY RUN", len(rows), len(idx)))
 
     warn: set = set()
-    created = fielded = failed = 0
+    created = fielded = failed = existing = 0
     errors: list[str] = []
     t0 = time.time()
     for i, row in enumerate(rows, 1):
@@ -205,9 +271,26 @@ def upload_rows(rows: list[dict], *, commit: bool = False,
                 print("  -> %d custom-field values\n" % len(pairs))
             continue
         try:
-            res = api.call("/property/", "POST", prop)
-            uuid = res.get("uuid") if isinstance(res, dict) else None
-            created += 1
+            # /api/internal/property/, NOT the bare /property/. As of 2026-09-02 the
+            # bare Open-API route 403s the minted user JWT on BOTH GET and POST
+            # ("You do not have permission to perform this action") on an account
+            # that is active, on the business plan, and holds the `upload`
+            # permission -- so it reads like a billing or role problem and is not.
+            # The internal route accepts the identical payload and returns 201.
+            try:
+                res = api.call("/api/internal/property/", "POST", prop)
+                uuid = res.get("uuid") if isinstance(res, dict) else None
+                created += 1
+            except Exception as e:
+                # Unlike the old bare /property/, the internal route does NOT upsert:
+                # a known address returns 400 "Property address already exists!" with
+                # the existing uuid in the body. Treat that as a find, not a failure,
+                # so re-running a file stays idempotent and still attaches custom
+                # fields and notes to the record that is already there.
+                uuid = _existing_uuid(e)
+                if not uuid:
+                    raise
+                existing += 1
             if uuid and pairs:
                 api.call("/api/internal/property/%s/custom-field/update-values/" % uuid,
                          "PATCH", pairs)
@@ -237,8 +320,10 @@ def upload_rows(rows: list[dict], *, commit: bool = False,
 
     err_path = ""
     if commit:
-        print("\ncreated=%d  custom-fields-set=%d  failed=%d  %.0fs"
-              % (created, fielded, failed, time.time() - t0))
+        print("\ncreated=%d  already-existed=%d  custom-fields-set=%d  failed=%d  %.0fs"
+              % (created, existing, fielded, failed, time.time() - t0))
+        _notify(rows, created, existing, fielded, failed,
+                time.time() - t0, label=notify_label)
         if errors:
             os.makedirs(out_dir, exist_ok=True)
             err_path = os.path.join(out_dir, "upload_errors.txt")
@@ -249,7 +334,8 @@ def upload_rows(rows: list[dict], *, commit: bool = False,
         print("\nNothing written. Re-run with --commit.")
 
     return {
-        "submitted": len(rows), "created": created, "fielded": fielded,
+        "submitted": len(rows), "created": created, "existing": existing,
+        "fielded": fielded,
         "failed": failed, "warnings": sorted(warn), "errors": errors,
         "error_file": err_path, "committed": commit,
         "seconds": round(time.time() - t0, 1),
@@ -257,15 +343,18 @@ def upload_rows(rows: list[dict], *, commit: bool = False,
 
 
 def upload_csv(path: str, *, commit: bool = False, limit: int = 0,
-               start: int = 0, sleep: float = 0.1, out_dir: str = "output") -> dict:
+               start: int = 0, sleep: float = 0.1, out_dir: str = "output",
+               notify_label: str = "") -> dict:
     """Read an upload CSV and push it. Same return shape as upload_rows."""
     with open(path, encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
+    notify_label = notify_label or os.path.basename(path)
     if start:
         rows = rows[start:]
     if limit:
         rows = rows[:limit]
-    return upload_rows(rows, commit=commit, sleep=sleep, out_dir=out_dir)
+    return upload_rows(rows, commit=commit, sleep=sleep, out_dir=out_dir,
+                       notify_label=notify_label)
 
 
 def main() -> int:
@@ -282,7 +371,7 @@ def main() -> int:
     # A commit run that created nothing from a non-empty file is a failure,
     # not a quiet success, the same class of bug as the 13 "successful"
     # zero-notice scrapes.
-    if a.commit and res["submitted"] and not res["created"]:
+    if a.commit and res["submitted"] and not (res["created"] + res.get("existing", 0)):
         return 1
     return 0
 

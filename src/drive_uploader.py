@@ -3,8 +3,12 @@
 import base64
 import json
 import logging
+import os
+import time
 from datetime import datetime
 from pathlib import Path
+
+UPLOAD_ATTEMPTS = 3
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -12,7 +16,18 @@ from googleapiclient.http import MediaFileUpload
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+# `drive.file` grants access ONLY to files the app itself created. A folder that a
+# human shared with the service account through the Drive UI is invisible under it,
+# and the API reports that as a bare 404 "File not found" on the folder id -- which
+# reads exactly like a wrong id or an unshared folder, and cost an hour to tell apart.
+# Verified live 2026-09-02 against the same key and folder: drive.file 404s,
+# drive succeeds and returns the folder.
+#
+# This is not as broad as it looks. A service account starts with an empty Drive and
+# can only ever see what has been explicitly shared with it, so "full" scope here
+# still means "the one folder the user shared".
+SCOPES = [(os.getenv("GOOGLE_DRIVE_SCOPE") or "").strip()
+          or "https://www.googleapis.com/auth/drive"]
 
 
 def _build_service(service_account_key_b64: str):
@@ -49,34 +64,50 @@ def upload_file(
     Returns:
         Google Drive webViewLink on success, None on failure.
     """
-    try:
-        service = _build_service(service_account_key_b64)
-        file_path = Path(file_path)
+    file_path = Path(file_path)
+    if not filename:
+        filename = file_path.name
+    if not mimetype:
+        mimetype = MIME_MAP.get(file_path.suffix.lower(), "application/octet-stream")
 
-        if not filename:
-            filename = file_path.name
-        if not mimetype:
-            mimetype = MIME_MAP.get(file_path.suffix.lower(), "application/octet-stream")
+    # This box drops the first TLS connection to Google endpoints often enough that
+    # a single-shot upload loses roughly one file per run (same ConnectionResetError
+    # / WinError 10054 already documented against chat.googleapis.com). Retry rather
+    # than silently lose an output file that cost a paid scrape to produce.
+    last_err: Exception | None = None
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        try:
+            service = _build_service(service_account_key_b64)
+            file_metadata = {"name": filename, "parents": [folder_id]}
+            media = MediaFileUpload(str(file_path), mimetype=mimetype)
 
-        file_metadata = {
-            "name": filename,
-            "parents": [folder_id],
-        }
-        media = MediaFileUpload(str(file_path), mimetype=mimetype)
+            # supportsAllDrives is REQUIRED when the parent lives in a Shared Drive.
+            # Without it the create call returns 404 "File not found" on a folder id
+            # that files().get() resolves perfectly well with the flag set -- the two
+            # calls disagreeing about the same folder is the tell.
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
 
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, webViewLink",
-        ).execute()
+            link = file.get("webViewLink", "")
+            logger.info("Uploaded %s to Drive: %s (%s)", mimetype, filename, link)
+            return link
 
-        link = file.get("webViewLink", "")
-        logger.info("Uploaded %s to Drive: %s (%s)", mimetype, filename, link)
-        return link
+        except Exception as e:                      # noqa: BLE001
+            last_err = e
+            if attempt < UPLOAD_ATTEMPTS:
+                wait = 2 ** (attempt - 1)
+                logger.warning("Drive upload attempt %d/%d failed for %s (%s), "
+                               "retrying in %ss", attempt, UPLOAD_ATTEMPTS,
+                               filename, type(e).__name__, wait)
+                time.sleep(wait)
 
-    except Exception:
-        logger.exception("Failed to upload file to Google Drive: %s", file_path)
-        return None
+    logger.error("Failed to upload %s to Drive after %d attempts: %s",
+                 file_path, UPLOAD_ATTEMPTS, last_err)
+    return None
 
 
 def upload_csv(
@@ -108,10 +139,15 @@ def upload_csv(
         }
         media = MediaFileUpload(str(csv_path), mimetype="text/csv")
 
+        # supportsAllDrives is REQUIRED when the parent lives in a Shared Drive.
+        # Without it the create call returns 404 "File not found" on a folder id
+        # that files().get() resolves perfectly well with the flag set -- the two
+        # calls disagreeing about the same folder is the tell.
         file = service.files().create(
             body=file_metadata,
             media_body=media,
             fields="id, webViewLink",
+            supportsAllDrives=True,
         ).execute()
 
         file_id = file.get("id")
@@ -174,6 +210,7 @@ def upload_summary(
             body=file_metadata,
             media_body=media,
             fields="id",
+            supportsAllDrives=True,   # see the note on upload_file
         ).execute()
 
         # Clean up temp file

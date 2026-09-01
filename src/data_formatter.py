@@ -324,7 +324,31 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
             written += 1
 
     logger.info("Wrote %d notices to %s", written, output_path)
+    _autoupload(output_path)
     return output_path
+
+
+def _autoupload(path: Path) -> None:
+    """Best-effort Google Drive upload of a freshly written CSV.
+
+    Hooked here rather than at each of main.py's several export sites so every CLI
+    pull path -- daily, historical, split, tax sale, photo import, CSV re-import --
+    gets it without anyone remembering a flag.
+
+    Skipped on the Apify path, which does its own Drive upload alongside the
+    key-value store write; hooking both would upload every file twice.
+    """
+    import os
+
+    if os.getenv("APIFY_IS_AT_HOME"):
+        return
+    if (os.getenv("SIFTSTACK_NO_DRIVE") or "").strip():
+        return
+    try:
+        from drive_autoupload import upload_outputs
+        upload_outputs([path], subfolder_note="TN notice pull", verbose=True)
+    except Exception as e:                      # noqa: BLE001 - never break a write
+        logger.warning("Drive auto-upload skipped: %s", e)
 
 
 def write_csv_by_type(notices: list[NoticeData]) -> list[Path]:

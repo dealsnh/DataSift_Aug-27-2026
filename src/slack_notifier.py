@@ -59,7 +59,8 @@ def _send_webhook(text: str, webhook_url: str | None = None, blocks: list | None
     payload: dict = {"text": text}
     if blocks and not _is_discord(webhook_url) and not _is_google_chat(webhook_url):
         payload["blocks"] = blocks
-    for attempt in range(2):
+    attempts = 3
+    for attempt in range(attempts):
         try:
             resp = requests.post(
                 webhook_url,
@@ -68,7 +69,7 @@ def _send_webhook(text: str, webhook_url: str | None = None, blocks: list | None
                 timeout=15,
             )
             # Honor Slack/Discord rate limiting once before giving up.
-            if resp.status_code == 429 and attempt == 0:
+            if resp.status_code == 429 and attempt < attempts - 1:
                 try:
                     wait = float(resp.headers.get("Retry-After", "1") or 1)
                 except (TypeError, ValueError):
@@ -79,7 +80,18 @@ def _send_webhook(text: str, webhook_url: str | None = None, blocks: list | None
                 logger.warning("Webhook post failed: HTTP %s", resp.status_code)
                 return False
             return True
-        except Exception:
+        except Exception as e:
+            # A dropped TLS connection used to return False on the spot, so the
+            # retry loop only ever covered 429s. This box resets the first
+            # connection to Google endpoints often enough that notifications were
+            # being lost outright -- the same WinError 10054 flake that cost a
+            # Drive upload per run. Retry the transport, not just the rate limit.
+            if attempt < attempts - 1:
+                logger.warning("Webhook post attempt %d/%d failed (%s), retrying",
+                               attempt + 1, attempts, type(e).__name__)
+                time.sleep(2 ** attempt)
+                continue
+            logger.warning("Webhook post failed after %d attempts: %s", attempts, e)
             return False
     return False
 
@@ -484,3 +496,44 @@ def send_record_package(
             webhook_url,
         )
     return ok
+
+
+def send_batch_summary(
+    title: str,
+    stats: dict | None = None,
+    *,
+    detail: list[str] | None = None,
+    warnings: list[str] | None = None,
+    links: list[tuple[str, str]] | None = None,
+    webhook_url: str | None = None,
+) -> bool:
+    """One notification for one completed batch of work.
+
+    The generic counterpart to send_slack_notification(), which only accepts
+    NoticeData objects and so cannot be used by any pipeline that works in plain
+    dicts or CSV rows -- which is why the whole Orange County run went out silent.
+    Every batch-style script (pull, resolve, upload, tag) calls this once when it
+    finishes, and never per record.
+
+    Suppressed by SIFTSTACK_NO_NOTIFY. Best effort: returns False rather than
+    raising, because a webhook must never take down a completed run.
+    """
+    if (os.environ.get("SIFTSTACK_NO_NOTIFY") or "").strip():
+        return False
+    try:
+        if not (webhook_url or _default_webhook_url()):
+            logger.warning("No GOOGLE_CHAT_WEBHOOK_URL or SLACK_WEBHOOK_URL set, "
+                           "skipping batch notification")
+            return False
+        lines = [f"*{title}*"]
+        for k, v in (stats or {}).items():
+            lines.append(f"{k}: {v}")
+        lines.extend(detail or [])
+        for w in (warnings or []):
+            lines.append(f"WARNING: {w}")
+        for label, url in (links or []):
+            lines.append(f"{label}: {url}")
+        return _send_webhook("\n".join(lines), webhook_url)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Batch notification failed: %s", e)
+        return False

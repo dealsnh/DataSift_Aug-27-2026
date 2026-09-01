@@ -235,6 +235,12 @@ def write_master_csv(master: list[dict], out_path: Path) -> None:
         for r in master:
             w.writerow(r)
 
+    try:
+        from drive_autoupload import upload_outputs
+        upload_outputs([out_path], subfolder_note="foreclosure master list")
+    except Exception as e:                      # noqa: BLE001 - never break the write
+        print("  Drive auto-upload skipped: %s" % str(e)[:160])
+
 
 def _month_hist(rows: list[dict]) -> str:
     from collections import Counter

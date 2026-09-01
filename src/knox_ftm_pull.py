@@ -812,6 +812,12 @@ def main() -> int:
             w.writerow([r.get("source"), r.get("notice_type"), r.get("address"),
                         r.get("case_number"), why])
 
+    try:
+        from drive_autoupload import upload_outputs
+        upload_outputs([a.out, a.rejects], subfolder_note="Knox first-to-market pull")
+    except Exception as e:                      # noqa: BLE001 - never break the pull
+        print("  Drive auto-upload skipped: %s" % str(e)[:160])
+
     print("\nKEPT   %d -> %s" % (len(kept), a.out))
     print("DROPPED %d -> %s" % (len(rejected), a.rejects))
     print("drop reasons:", dict(Counter(w for _, w in rejected)))

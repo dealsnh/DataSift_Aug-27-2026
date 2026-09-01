@@ -1,5 +1,13 @@
 # Credentials & secrets
 .env
+# A bare `.env` does NOT match .env.bak / .env.local / .env.20260902 -- a backup
+# taken before editing credentials is every bit as sensitive as the original.
+.env.*
+!.env.example
+*.bak-[0-9]*
+# Google service account keys download as <project>-<12 hex>.json
+*service-account*.json
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
 input.json
 input_foreclosure_daily.json
 
