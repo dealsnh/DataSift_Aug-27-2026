@@ -108,19 +108,10 @@ def main() -> int:
 
     print(f"\ntagged={tagged}  already-had-it={already}  failed={failed}")
 
-    try:
-        from slack_notifier import send_batch_summary
-        send_batch_summary(
-            f"DataSift tag applied - {canon!r}",
-            {"source": Path(a.csv).name,
-             "records": len(rows),
-             "newly tagged": tagged,
-             "already had it": already,
-             "failed": failed},
-            warnings=([f"{failed} record(s) failed"] if failed else None),
-        )
-    except Exception as e:                      # noqa: BLE001
-        print("  notification skipped: %s" % str(e)[:140])
+    # No batch notification here on purpose (Ty, 2026-09-03): this is a
+    # follow-on retag of records step 3 already reported. Verify success in
+    # the terminal counts above / --commit exit code instead of Google Chat.
+
     # Tagging nothing across a non-empty file is a failure, not a quiet success.
     return 1 if (rows and not (tagged + already)) else 0
 
