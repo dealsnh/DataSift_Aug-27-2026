@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 from datetime import date
@@ -208,6 +209,32 @@ def main():
               f"{u['owner']!r}  ({u['reason']})")
     print(f"\n  estimated SmartSkip cost at $0.15/hit: ${0.15*len(rows):.2f} "
           f"(billed only on rows that return data)")
+
+    # Deep Prospecting gets its OWN Chat space, not the FTM one -- resolve
+    # explicitly rather than falling back to _default_webhook_url(), which
+    # would silently cross-post into the wrong channel if this var is unset.
+    try:
+        dp_webhook = (os.environ.get("GOOGLE_CHAT_WEBHOOK_URL_DEEP_PROSPECTING") or "").strip()
+        if dp_webhook:
+            from slack_notifier import send_batch_summary
+            send_batch_summary(
+                "Deep Prospecting - Stage A input build",
+                {"top requested": args.top,
+                 "qualified pool": meta["qualified"],
+                 "SmartSkip traceable": len(rows),
+                 "entity owners (-> BusinessV2)": len(entities),
+                 "unusable names": len(unusable)},
+                detail=[f"estimated SmartSkip cost: ${0.15*len(rows):.2f} at $0.15/hit "
+                        f"(billed only on rows that return data)",
+                        f"file: {csv_path}"],
+                warnings=([f"{len(unusable)} unusable name(s) dropped, see stage_a_audit.json"]
+                          if unusable else None),
+                webhook_url=dp_webhook,
+            )
+        else:
+            print("  notification skipped: GOOGLE_CHAT_WEBHOOK_URL_DEEP_PROSPECTING not set")
+    except Exception as e:                      # noqa: BLE001
+        print("  notification skipped: %s" % str(e)[:140])
 
 
 if __name__ == "__main__":

@@ -473,6 +473,36 @@ def main():
     print(f"  dial tier mix                      {summary['dial_tier_mix']}")
     print(f"\nwrote {outdir}/dm_dial_sheet.csv, per_record.csv, summary.json")
 
+    # Deep Prospecting gets its OWN Chat space, not the FTM one -- resolve
+    # explicitly rather than falling back to _default_webhook_url(), which
+    # would silently cross-post into the wrong channel if this var is unset.
+    try:
+        dp_webhook = (os.environ.get("GOOGLE_CHAT_WEBHOOK_URL_DEEP_PROSPECTING") or "").strip()
+        if dp_webhook:
+            from slack_notifier import send_batch_summary
+            stage_label = "rank-only" if args.rank_only else \
+                          "+".join(s for s, on in (("tracerfy", args.tracerfy),
+                                                    ("trestle", args.trestle)) if on) or "rank-only"
+            send_batch_summary(
+                f"Deep Prospecting - stages run ({stage_label})",
+                {"records processed": summary["records_submitted"],
+                 "records with a hit": summary["records_with_a_hit"],
+                 "hit rate": f"{summary['hit_rate_pct']}%",
+                 "decision makers/record": summary["decision_makers_per_record"],
+                 "mailable DM addresses/record": summary["mailable_dm_addresses_per_record"]},
+                detail=[f"relatives returned: {tot_rel}, ranked as DMs: {tot_dm} "
+                        f"({100*tot_dm/max(tot_rel,1):.0f}%)",
+                        f"dial tier mix: {summary['dial_tier_mix']}",
+                        f"files: {outdir}/dm_dial_sheet.csv, per_record.csv"],
+                warnings=(["Stage C (obituary/web research for true DOD + survivors) is "
+                           "mandatory and NOT run here -- verify before mailing"]),
+                webhook_url=dp_webhook,
+            )
+        else:
+            print("  notification skipped: GOOGLE_CHAT_WEBHOOK_URL_DEEP_PROSPECTING not set")
+    except Exception as e:                      # noqa: BLE001
+        print("  notification skipped: %s" % str(e)[:140])
+
 
 if __name__ == "__main__":
     main()
