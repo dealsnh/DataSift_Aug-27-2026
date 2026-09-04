@@ -130,6 +130,20 @@ async def load_cookies(context) -> bool:
 
 # ── Authentication ────────────────────────────────────────────────────
 
+async def _looks_authenticated(page) -> bool:
+    """True only if the current URL is a real authenticated app route.
+
+    `?next=` is the tell for a bounce back to the login gate: the app redirects
+    to "/?next=%2Frecords%2Fproperties" when the session is dead, and that URL
+    contains the URL-ENCODED path (%2Frecords), so a naive `"/records" in url`
+    test does not catch it while a `"/login" not in url` test passes happily.
+    """
+    url = page.url
+    if "/login" in url or "next=" in url or "/signout" in url:
+        return False
+    return "/records" in url or "/dashboard" in url
+
+
 async def login(page, email: str = None, password: str = None) -> bool:
     """Log in to DataSift.ai (app.reisift.io). Returns True on success.
 
@@ -146,11 +160,19 @@ async def login(page, email: str = None, password: str = None) -> bool:
     if has_cookies:
         await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(5000)
-        current_url = page.url
-        if "/login" not in current_url and ("/dashboard" in current_url or "/records" in current_url):
-            logger.info("DataSift session restored from cookies")
-            return True
-        logger.info("DataSift cookies expired (url=%s), doing fresh login", current_url)
+        if await _looks_authenticated(page):
+            # Check TWICE, seconds apart. The SPA renders /records/properties
+            # first and only THEN validates the session, bouncing to
+            # "/?next=%2Frecords%2Fproperties" if it is dead -- so a single
+            # check right after the first wait races that redirect and reports
+            # a stale session as live. Every downstream step then runs against
+            # the login page and fails with nonsense errors like "No Filter
+            # Records link found" (seen repeatedly, 2026-09-04).
+            await page.wait_for_timeout(3000)
+            if await _looks_authenticated(page):
+                logger.info("DataSift session restored from cookies")
+                return True
+        logger.info("DataSift cookies expired (url=%s), doing fresh login", page.url)
 
     # Fresh login
     await page.goto(DATASIFT_LOGIN_URL, wait_until="domcontentloaded")
@@ -177,8 +199,14 @@ async def login(page, email: str = None, password: str = None) -> bool:
     # authenticated route and verify the session by whether we get bounced back to login.
     await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(4000)
-    if "/login" in page.url:
-        logger.error("DataSift login failed — still on login page")
+    # Same double-check as the cookie path: the bounce to "/?next=..." can land
+    # after the first look, and a single check would call a failed login good.
+    if not await _looks_authenticated(page):
+        logger.error("DataSift login failed — not on an authenticated route (url=%s)", page.url)
+        return False
+    await page.wait_for_timeout(3000)
+    if not await _looks_authenticated(page):
+        logger.error("DataSift login bounced back to the gate (url=%s)", page.url)
         return False
 
     await save_cookies(page)

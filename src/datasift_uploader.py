@@ -10,6 +10,7 @@ Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import config
@@ -623,8 +624,222 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         return False
 
 
+async def _wait_for_visible(page: Page, selectors: list[str], timeout_ms: int = 15000):
+    """Poll until one of `selectors` matches a VISIBLE element; return that
+    locator, or None on timeout.
+
+    DataSift's modals render their shell immediately and then load the actual
+    content behind a spinner, so a bare `.count()` check taken right after the
+    modal opens sees an empty dialog and reports "button not found" -- which is
+    indistinguishable from the button genuinely not existing. Confirmed live
+    2026-09-04: a screenshot at that exact moment showed only a spinner.
+    """
+    elapsed, step = 0, 500
+    while elapsed < timeout_ms:
+        for sel in selectors:
+            loc = page.locator(sel)
+            try:
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    return loc
+            except Exception:
+                pass
+        await page.wait_for_timeout(step)
+        elapsed += step
+    return None
+
+
+async def _abandon_filter_panel(page: Page) -> None:
+    """Close the filter panel/overlay on a failure path. Left uncalled once
+    already: an aborted `_filter_by_tags` left `#asideOverlay` open, which then
+    blocked every subsequent click (Manage, Send To) with "intercepts pointer
+    events" -- the failure that took down BOTH the enrich and skip trace steps
+    in the same run, since the second inherited the first's stuck panel."""
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(800)
+        overlay = page.locator('#asideOverlay')
+        if await overlay.count() > 0 and await overlay.first.is_visible():
+            await overlay.first.click(force=True, position={"x": 5, "y": 5})
+            await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+
+async def _wait_for_tag_option(page: Page, tag: str, timeout_ms: int = 10000):
+    """Poll for the tag's EXACT dropdown option rather than a single fixed wait
+    -- the live-search dropdown population time is not fixed, and the first
+    version's flat 1500ms wait was the likely cause of a real, false
+    "Priority 2 not found" failure.
+
+    NO fuzzy/partial fallback: a `get_by_text(tag, exact=False)` fallback was
+    tried here once and matched "SiftMap" for the tag "FTM" (SiftMap contains
+    the substring "ftM"), then spent 30s trying to click a hidden, unrelated
+    element. An exact match that never appears should stay a clean failure,
+    not silently click the wrong thing.
+    """
+    elapsed = 0
+    step = 500
+    while elapsed < timeout_ms:
+        option = page.locator(f'text="{tag}"')
+        if await option.count() > 0:
+            return option
+        await page.wait_for_timeout(step)
+        elapsed += step
+    return None
+
+
+async def _filter_by_tags(page: Page, tags: list[str]) -> bool:
+    """Filter records page by an ALL-tags-match (AND) filter block. Mirrors
+    _filter_by_list's mechanics, but against "Tags" instead of "Lists" --
+    needed because enrich_records/skip_trace_records otherwise only know how to
+    scope to a whole shared list (e.g. "Foreclosure" holds every foreclosure
+    record in the account, not just one day's pull), which would enrich/skip
+    trace records far outside the batch actually intended.
+
+    ANY failure path here calls _abandon_filter_panel before returning, so a
+    caller never inherits a stuck overlay from a half-finished filter attempt.
+    """
+    try:
+        await _dismiss_popups(page)
+
+        filter_link = page.locator('#Records__Filters_Trigger')
+        if await filter_link.count() == 0:
+            filter_link = page.locator('a:has-text("Filter Records")')
+        if await filter_link.count() > 0:
+            await filter_link.first.click()
+            await page.wait_for_timeout(2000)
+        else:
+            logger.warning("No Filter Records link found (url=%s)", page.url)
+            await _screenshot(page, "filter_by_tags_no_link")
+            return False
+
+        await _dismiss_popups(page)
+
+        filter_search = page.locator('#RecordsFilters__Filter_Blocks__Search')
+        if await filter_search.count() == 0:
+            filter_search = page.locator('input[placeholder*="filter block"]')
+        if await filter_search.count() > 0:
+            await filter_search.first.click()
+            await filter_search.first.fill("Tags")
+            await page.wait_for_timeout(1500)
+
+            all_tags = page.locator('text="All Tags (AND)"')
+            if await all_tags.count() > 0:
+                await all_tags.first.click()
+                await page.wait_for_timeout(2000)
+                logger.debug("Selected 'All Tags (AND)' filter block")
+            else:
+                logger.warning("'All Tags (AND)' option not found")
+                await _screenshot(page, "filter_by_tags_no_all_tags_option")
+                await _abandon_filter_panel(page)
+                return False
+        else:
+            logger.warning("Filter block search input not found")
+            await _abandon_filter_panel(page)
+            return False
+
+        tag_search = page.locator('input[placeholder*="Search for tags"]')
+        for tag in tags:
+            if await tag_search.count() == 0:
+                tag_search = page.locator('input[placeholder*="Search for tags"]')
+            if await tag_search.count() == 0:
+                logger.warning("'Search for tags...' input not found for %r", tag)
+                await _abandon_filter_panel(page)
+                return False
+            await tag_search.first.fill(tag)
+            await _screenshot(page, f"filter_by_tags_typed_{tag.replace(' ', '_')}")
+            tag_option = await _wait_for_tag_option(page, tag)
+            if tag_option is not None:
+                await tag_option.last.click()
+                await page.wait_for_timeout(800)
+                logger.info("Added tag filter: %s", tag)
+            else:
+                logger.warning("Tag option %r not found in dropdown after polling", tag)
+                await _screenshot(page, f"filter_by_tags_missing_{tag.replace(' ', '_')}")
+                await _abandon_filter_panel(page)
+                return False
+            await tag_search.first.fill("")
+
+        apply_btn = page.locator('text="Apply Filters"')
+        if await apply_btn.count() > 0:
+            await apply_btn.first.click()
+            await page.wait_for_timeout(3000)
+            logger.info("Applied tag filters: %s", tags)
+        else:
+            close_x = page.locator('[class*="Aside"] button:has-text("×")')
+            if await close_x.count() > 0:
+                await close_x.first.click()
+            else:
+                await page.keyboard.press("Escape")
+            await page.wait_for_timeout(2000)
+
+        await _screenshot(page, "filter_by_tags_applied")
+        return True
+    except Exception as e:
+        logger.warning("Filter by tags failed: %s", e)
+        await _screenshot(page, "filter_by_tags_failed")
+        await _abandon_filter_panel(page)
+        return False
+
+
+async def _select_max_records(page: Page) -> int:
+    """Select EVERY record matching the current filter, not just the visible
+    page, via the checkbox dropdown's "Select Max (N)" option. Returns the
+    count it reports, or 0 if the dropdown route did not work.
+
+    THIS IS NOT COSMETIC. The header checkbox alone selects only the rows
+    rendered on the current page -- 10 of them by default -- so an enrich or
+    skip trace launched after it silently processes the first page and reports
+    success. Caught live 2026-09-04: a 39-record batch logged "Selecting 10
+    properties" and both actions ran against 10. `add_siftmap_records` already
+    used this dropdown; enrich/skip trace never did.
+    """
+    try:
+        dropdown = page.locator('[class*="CheckboxDropdown"]').first
+        if await dropdown.count() == 0:
+            logger.warning("Checkbox dropdown container not found")
+            return 0
+        # Click the CARET on the right of the container, not its centre -- the
+        # centre is the checkbox itself, which just selects the visible page.
+        box = await dropdown.bounding_box()
+        if box:
+            await page.mouse.click(box["x"] + box["width"] - 10,
+                                   box["y"] + box["height"] / 2)
+        else:
+            await dropdown.click()
+        await page.wait_for_timeout(1500)
+
+        # The Records page labels this "Select all (N)". "Select Max (N)" is the
+        # SiftMap page's wording -- looking only for that (as the first version
+        # did) silently found nothing here and fell back to page-one selection.
+        opt = None
+        for pattern in (r"Select all", r"Select Max"):
+            cand = page.get_by_text(re.compile(pattern, re.I))
+            if await cand.count() > 0:
+                opt = cand
+                break
+        if opt is None:
+            logger.warning("No 'Select all'/'Select Max' option in the dropdown")
+            await page.keyboard.press("Escape")
+            return 0
+
+        label = (await opt.first.text_content()) or ""
+        await opt.first.click()
+        await page.wait_for_timeout(2500)
+        logger.info("Clicked '%s'", label.strip())
+        m = re.search(r"(\d[\d,]*)", label)
+        return int(m.group(1).replace(",", "")) if m else -1
+    except Exception as e:
+        logger.warning("Select all failed: %s", e)
+        return 0
+
+
 async def _select_all_records(page: Page) -> bool:
-    """Select all records on the current page. Returns True if selected."""
+    """Select all records matching the current filter. Returns True if selected.
+
+    Prefers "Select Max (N)" (the whole filtered set) and only falls back to
+    the page-level header checkbox if that dropdown is unavailable.
+    """
     try:
         # Dismiss popups aggressively — the notification popup blocks all clicks
         await _dismiss_popups(page)
@@ -633,6 +848,18 @@ async def _select_all_records(page: Page) -> bool:
         await page.wait_for_timeout(500)
 
         await _screenshot(page, "before_select_all")
+
+        # Whole filtered set first; page-only selection is the fallback.
+        n = await _select_max_records(page)
+        if n:
+            logger.info("Selected ALL filtered records via the dropdown (%s)",
+                        f"{n} reported" if n > 0 else "count not parsed")
+            manage_visible = await page.locator('button:has-text("Manage")').count() > 0
+            send_to_visible = await page.locator('button:has-text("Send To")').count() > 0
+            if manage_visible or send_to_visible:
+                return True
+            logger.warning("Select Max reported %d but no action buttons appeared; "
+                           "falling back to the page checkbox", n)
 
         # Strategy 1: Find the header checkbox position via JS, then use Playwright
         # mouse.click to properly trigger React's event system.
@@ -717,35 +944,51 @@ async def _select_all_records(page: Page) -> bool:
         return False
 
 
-async def enrich_records(page: Page, list_name: str) -> dict:
+async def enrich_records(page: Page, list_name: str = "", tags: list[str] | None = None) -> dict:
     """Enrich uploaded records with DataSift's SiftMap property data.
 
-    UI Flow: Records → Filter by list → Select all → Manage → Enrich Data
-    → toggle "Enrich Property Information" ON → click "Enrich"
+    UI Flow: Records → Filter by list (or by tags) → Select all → Manage →
+    Enrich Data → toggle "Enrich Property Information" ON → click "Enrich"
 
     Only enriches property info (beds, baths, Zestimate, sqft, sale history).
     Owner enrichment is OFF to protect our PR/DM contact mapping.
 
     Args:
         page: Logged-in Playwright page.
-        list_name: Name of the list to filter and enrich.
+        list_name: Name of the list to filter and enrich. A bare list name
+            scopes to EVERY record ever put on that shared list, which is
+            usually far wider than one pull -- pass `tags` instead to scope to
+            one specific batch (e.g. a `pulled_<date>` tag).
+        tags: If given, filters by an ALL-tags-match (AND) block instead of a
+            list. Takes precedence over list_name.
 
     Returns:
         Dict with {success, message}.
     """
     result = {"success": False, "message": ""}
-    logger.info("Starting DataSift enrichment for list: %s", list_name)
+    logger.info("Starting DataSift enrichment for %s",
+                f"tags={tags}" if tags else f"list: {list_name}")
 
     try:
         # Navigate to Records
         await _navigate_to_records(page)
 
-        # Filter to the uploaded list
-        filtered = await _filter_by_list(page, list_name)
+        # Filter to the uploaded list, or to the exact tag set for one batch
+        filtered = await _filter_by_tags(page, tags) if tags else await _filter_by_list(page, list_name)
         if not filtered:
+            if tags:
+                # A tag filter exists SPECIFICALLY to avoid enriching outside one
+                # batch (see the module docstring above) -- if it fails, selecting
+                # "all" would select whatever the unfiltered/default view shows,
+                # which is everything, not the batch that was actually meant.
+                # Abort rather than silently widen scope.
+                result["message"] = "Could not apply the tag filter -- aborting rather than risk enriching outside the intended batch"
+                logger.error(result["message"])
+                return result
             result["message"] = "Could not filter to list for enrichment"
             logger.warning(result["message"])
-            # Continue anyway — may enrich whatever is showing
+            # A bare list name is already the account-wide scope, so continuing
+            # here doesn't widen anything further.
 
         # Select all records
         selected = await _select_all_records(page)
@@ -861,7 +1104,7 @@ async def enrich_records(page: Page, list_name: str) -> dict:
 
         # Enrichment runs in background — we don't need to wait for completion
         result["success"] = True
-        result["message"] = "Enrichment started — track progress in Activity → Action Page"
+        result["message"] = "Enrichment started -- track progress in Activity -> Action Page"
         logger.info(result["message"])
 
     except Exception as e:
@@ -872,31 +1115,42 @@ async def enrich_records(page: Page, list_name: str) -> dict:
     return result
 
 
-async def skip_trace_records(page: Page, list_name: str) -> dict:
+async def skip_trace_records(page: Page, list_name: str = "", tags: list[str] | None = None) -> dict:
     """Skip trace uploaded records for phone numbers + emails.
 
-    UI Flow: Records → Filter by list → Select all → Send To → Skip Trace
-    → agree to terms → add tag → click "Skip Trace Records"
+    UI Flow: Records → Filter by list (or by tags) → Select all → Send To →
+    Skip Trace → agree to terms → add tag → click "Skip Trace Records"
 
     Uses the unlimited skip trace plan ($97/mo) — no per-record cost.
 
     Args:
         page: Logged-in Playwright page.
-        list_name: Name of the list to filter and skip trace.
+        list_name: Name of the list to filter and skip trace. See the same
+            scoping caution in enrich_records's docstring -- prefer `tags`.
+        tags: If given, filters by an ALL-tags-match (AND) block instead of a
+            list. Takes precedence over list_name.
 
     Returns:
         Dict with {success, message}.
     """
     result = {"success": False, "message": ""}
-    logger.info("Starting DataSift skip trace for list: %s", list_name)
+    logger.info("Starting DataSift skip trace for %s",
+                f"tags={tags}" if tags else f"list: {list_name}")
 
     try:
         # Navigate to Records (may already be there from enrichment)
         await _navigate_to_records(page)
 
-        # Filter to the uploaded list
-        filtered = await _filter_by_list(page, list_name)
+        # Filter to the uploaded list, or to the exact tag set for one batch
+        filtered = await _filter_by_tags(page, tags) if tags else await _filter_by_list(page, list_name)
         if not filtered:
+            if tags:
+                # Same reasoning as enrich_records: a failed tag filter must not
+                # fall through to "select whatever's showing" -- that risks
+                # skip tracing records far outside the intended batch.
+                result["message"] = "Could not apply the tag filter -- aborting rather than risk skip tracing outside the intended batch"
+                logger.error(result["message"])
+                return result
             logger.warning("Could not filter to list for skip trace — continuing anyway")
 
         # Select all records
@@ -924,14 +1178,28 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
 
         await _screenshot(page, "skip_send_to_opened")
 
-        # Click "Skip Trace" option
+        # Click "Skip Trace" option. A live run caught this click silently doing
+        # nothing (the "Send to..." dropdown was still open, unchanged, in the
+        # screenshot taken right after) -- most likely the same pointer-event
+        # interception class of bug seen elsewhere in this UI. Verify the
+        # dropdown actually closed; retry with a JS click if it didn't.
         skip_option = page.locator('text="Skip Trace"')
         if await skip_option.count() == 0:
             skip_option = page.locator('text="Skip trace"')
         if await skip_option.count() > 0:
-            await skip_option.first.click()
-            await page.wait_for_timeout(2000)
-            logger.debug("Opened Skip Trace modal")
+            for attempt in range(2):
+                await skip_option.first.click()
+                await page.wait_for_timeout(2000)
+                # The dropdown's own "Skip Trace" option should no longer be
+                # visible once a real navigation happened.
+                if await skip_option.count() == 0 or not await skip_option.first.is_visible():
+                    logger.debug("Opened Skip Trace modal (attempt %d)", attempt + 1)
+                    break
+                logger.warning("Skip Trace click did not advance the UI (attempt %d), retrying with JS click", attempt + 1)
+                await skip_option.first.evaluate("el => el.click()")
+                await page.wait_for_timeout(2000)
+                if await skip_option.count() == 0 or not await skip_option.first.is_visible():
+                    break
         else:
             await _screenshot(page, "skip_no_option")
             result["message"] = "Could not find 'Skip Trace' option in Send To menu"
@@ -941,11 +1209,17 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         await _screenshot(page, "skip_modal")
 
         # Skip Trace modal is a 3-step wizard: Terms → Review → Sent!
-        # Step 1: Click "I Agree with the terms" button
-        agree_btn = page.locator('button:has-text("I Agree with the terms")')
-        if await agree_btn.count() == 0:
-            agree_btn = page.locator('button:has-text("I Agree")')
-        if await agree_btn.count() > 0:
+        # Step 1: Click "I Agree with the terms" button.
+        # The modal's CONTENT loads asynchronously behind a spinner -- an
+        # instant .count() check here fails on an empty, still-loading dialog
+        # and reads exactly like "the button doesn't exist" (confirmed live
+        # 2026-09-04 via a screenshot showing the spinner). Poll for it.
+        agree_btn = await _wait_for_visible(
+            page,
+            ['button:has-text("I Agree with the terms")', 'button:has-text("I Agree")'],
+            timeout_ms=20000,
+        )
+        if agree_btn is not None:
             await agree_btn.first.click()
             logger.info("Clicked 'I Agree with the terms'")
             await page.wait_for_timeout(2000)
@@ -958,9 +1232,15 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         await _screenshot(page, "skip_review_step")
 
         # Step 2: Review step — may have tag input and a "Skip Trace" / confirm button
-        # Add a custom tag (optional — DataSift auto-tags too)
-        tag_input = page.locator('input[placeholder*="tag"], input[placeholder*="Tag"], input[placeholder*="Add tag"]')
-        if await tag_input.count() > 0:
+        # Add a custom tag (optional — DataSift auto-tags too). Same async-load
+        # caveat as the terms step above, so poll rather than check instantly.
+        tag_input = await _wait_for_visible(
+            page,
+            ['input[placeholder*="tag"]', 'input[placeholder*="Tag"]',
+             'input[placeholder*="Add tag"]'],
+            timeout_ms=15000,
+        )
+        if tag_input is not None:
             from datetime import datetime as _dt
             tag = f"skip_traced_{_dt.now().strftime('%Y-%m')}"
             await tag_input.first.fill(tag)
@@ -968,18 +1248,39 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
             await tag_input.first.press("Enter")
             await page.wait_for_timeout(500)
             logger.info("Added skip trace tag: %s", tag)
+            # The tag input's own suggestion/display chip can be left rendered
+            # ON TOP of the submit button below it, blocking a direct click with
+            # "intercepts pointer events" -- confirmed live 2026-09-04. DO NOT
+            # try to dismiss it with Escape or a body click: both were tried and
+            # BOTH closed the entire Skip Trace modal instead of just the
+            # dropdown (Escape is a generic close-dialog shortcut here). The
+            # submit button click below already has a JS-click fallback for
+            # exactly this interception case -- that's the real fix, not
+            # dismissing something first.
 
         await _screenshot(page, "skip_ready")
 
-        # Click the confirm/submit button to start skip trace
-        # Try multiple possible button texts
-        for btn_text in ["Skip Trace", "Skip Trace Records", "Start Skip Trace", "Submit", "Confirm", "Process"]:
-            skip_btn = page.locator(f'button:has-text("{btn_text}")')
-            if await skip_btn.count() > 0:
-                await skip_btn.first.click()
-                logger.info("Clicked '%s' — processing started", btn_text)
-                await page.wait_for_timeout(3000)
-                break
+        # Click the confirm/submit button to start skip trace. Poll for it for
+        # the same async-render reason, then click with a JS fallback for the
+        # tag-suggestion chip that can sit on top of it.
+        submit_btn = await _wait_for_visible(
+            page,
+            [f'button:has-text("{t}")' for t in
+             ["Skip Trace records", "Skip Trace Records", "Skip Trace",
+              "Start Skip Trace", "Submit", "Confirm", "Process"]],
+            timeout_ms=15000,
+        )
+        if submit_btn is not None:
+            try:
+                await submit_btn.first.click(timeout=8000)
+            except Exception:
+                # Fall back to a JS click, which bypasses the pointer-event
+                # interception check entirely -- the same escape hatch this
+                # project already uses elsewhere for exactly this UI.
+                logger.warning("Direct click intercepted, falling back to JS click")
+                await submit_btn.first.evaluate("el => el.click()")
+            logger.info("Clicked skip trace submit -- processing started")
+            await page.wait_for_timeout(3000)
         else:
             await _screenshot(page, "skip_no_button")
             result["message"] = "Could not find skip trace submit button"
@@ -990,7 +1291,7 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
 
         # Skip trace runs in background — we don't need to wait
         result["success"] = True
-        result["message"] = "Skip trace started — track progress in Activity → Skip Trace tab"
+        result["message"] = "Skip trace started -- track progress in Activity -> Skip Trace tab"
         logger.info(result["message"])
 
     except Exception as e:
