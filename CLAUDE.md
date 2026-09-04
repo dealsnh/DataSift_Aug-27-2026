@@ -226,6 +226,169 @@ A test pull for a brand-new county (Orange County, CA — Foreclosure + Probate,
 
 **Address resolution is Enformion on the DECEDENT, because the Knox TN route is illegal in California.** CA forbids searching the Assessor by owner name and the OC Assessor withholds the owner name even on a known-APN lookup, so `probate-property-finder`'s assessor-name-search pattern does not transfer. `occa_address_resolve.py` takes the decedent's most recent Orange County address. **Four traps, each of which put a WRONG address on a real record during the live run:** Orange County also exists in **Florida** (matching the county name without the state put "Po Box 4092, Winter Park 32793" on a Santa Ana estate); **PO boxes are mailing addresses, not properties**; `results_per_page` defaults to **5 and silently hides the right person** on any common name (25+ is the floor, six of fifteen records were falsely unresolved at 5); and **candidates must be ranked only on evidence that distinguishes them** — the first version scored record-level facts like "the PR shares the decedent's surname", equally true of all 50 candidates, which made the ordering arbitrary and moved one estate's address between two runs differing only in page size. What actually discriminates: the PR appearing in the candidate's relatives graph (**`relativesSummary` entries carry `firstName`/`lastName` at the TOP LEVEL, not nested under `name`** — reading it as `r["name"]` silently matches nothing and throws away the single best signal, 49 relatives sat unused on one record), a date of death within the 3-year window, middle-name agreement, and how many same-named people have an OC address at all (exactly one is a strong venue match, five is a coin flip). Name variants matter: the notice's own aka, the middle token as surname (Hispanic paternal surname, maiden name), and the compound surname. **Enformion death data is sparse — ~1 in 25 candidates carries a DOD — so nothing may depend on it.** A resolved address is the decedent's last known RESIDENCE, never proof of title; every row ships a `must_verify` note pointing at the Recorder index or the Inventory & Appraisal.
 
+## Orange County CA source map, consolidated (2026-09-03)
+
+Ty supplied nine URLs and asked whether these were already added — seven were already scattered across the research notes above at different stages (working, built-but-broken, or identified-but-untested), two are genuinely new. Consolidating here as the reference list to build against, rather than leaving status buried across separate dated paragraphs.
+
+**Probate — working today.** `www.capublicnotice.com` (singular domain) is the live primary source (`occa_ftm_pull.py`). `probatepublic.occourts.org` has a single-case-number lookup path that was scripted but never actually confirmed working end to end (an earlier claim of success here was wrong and got corrected); its bulk date-range search is Cloudflare-blocked even with a CAPTCHA solve. `occourts.org/online-services/case-access/probate-case-access` is just the court's own directions page pointing at the site above, not a separate data source.
+
+**Foreclosure — FIXED 2026-09-03. The Recorder Document Type search now works and returns 367 real, current trustee-sale filings.** `cr.occlerkrecorder.gov/RecorderWorksInternet`'s Document Type search (code 210, "NT TRUSTEE SALE") was reverse-engineered from its own JS (`RecorderWorksClient.js`, `validator.js`, and an inline page script) rather than driven blind through the UI. The site's own "Search" button was never a checkbox/date problem -- it was a broken callback chain: `search.OnSearch()` first POSTs to `Presentors/SearchHelpPresentor.aspx` (an audit/logging call) and only fires the REAL search (`search.Search()` -> `POST Presentors/AjaxPresentor.aspx`) from that first call's success callback; in a scripted Scrapfly browser that first call returns HTTP 200 with an empty body and the success callback never fires, so the real search is silently never sent -- indistinguishable from "the results container is empty" from the outside, which is exactly what every earlier attempt saw. **The fix: skip `OnSearch` entirely and call `search.Search(query, null, null)` directly**, with `query` built exactly as the client JS builds it: `&FromDate=MM/DD/YYYY&ToDate=MM/DD/YYYY&DocumentTypes=210,&DocumentNames=NT TRUSTEE SALE,&ERetrievalGroup=1&SearchMode=3&IsNewSearch=true` (the trailing comma on `DocumentTypes`/`DocumentNames` is real, from `documentTypes.OnFillHiddenDocType()`). Two required-field gates that silently no-op the search if skipped, found in `validator.js`'s `OnSearchValidation`: at least one Document Type checkbox must be checked (hidden field `getparam=DocumentTypes` non-empty) AND both FromDate/ToDate must carry a valid date (both inputs are `required="required"`). **Live result, 09/03/2025-09/03/2026: 367 records, most recent recorded 9/1/2026** (two days before this was run) -- proof CA trustee sales are actively being recorded in Orange County even though newspaper syndication of the notices stopped in December 2025. Each result row carries: Document Number (`2026000247324` format), a Grantor block that can hold multiple names (e.g. the trustee company AND the trustor/property-owner both appear as "Grantor" on this doc type; the Grantee block is typically empty on a trustee-sale filing), Document Type text, Recording Date, page count, and an internal `docid` used by `detailsContainer.showDetails()` for a per-record detail view. **Not yet confirmed: whether a structured property address/APN is available** (from the detail view, or only from the imaged document itself) -- that's the next thing to check before this becomes a usable lead list. Reverse-engineering script kept as the working reference: `src/occa_recorder_probe2.py` (not yet a production pull). `capublicnotices.com` (plural domain) measured at ~1.4% usable yield and is now superseded twice over -- first by the singular-domain site, now by this. `ocreporter.news`, `legaladstore.com`, and `ocrecorder.com` were all checked and are dead ends / redirects to sources already covered above -- none of them were the missing piece; the missing piece was a callback-chain bug in the Recorder's own JS.
+
+**Tax Sale (a future notice type, not foreclosure).** `octreasurer.gov/taxauction` (tax-defaulted property auctions) and `taxbill.octreasurer.gov` (per-parcel bill lookup, confirmed to be a heavy client-rendered SPA that needs a scripted form-fill) — both identified, neither automated yet.
+
+**Pre-probate (owner died, no court filing yet) — still an open gap.** None of these nine cover it; all nine are court, recorder, or tax-collector sites, and pre-probate by definition has no filing yet to find at any of them. It needs an obituary-style source, which has not been identified for Orange County.
+
+## Orange County CA property/tax-roll source map (2026-09-03) — for Senior Homeowner / Absentee Landlord / Out-of-State Landlord
+
+Ty supplied 8 more URLs for the still-unbuilt gap: these three are owner-CHARACTERISTIC segments (owns free and clear, lives elsewhere, is elderly), not notice types, and need a bulk property/tax roll -- the same kind of source the Sphere-of-Influence pipeline pulls for free across six Ohio counties. Checked live 2026-09-03 (WebFetch, no Scrapfly needed -- these are separate from the RecorderWorks quota):
+
+**No free bulk roll download exists from the Assessor -- confirmed, not assumed.** `ocassessor.gov/page/assessor-roll-products` sells individual parcel/roll PAGES ($1-1.50 each) and comp-sales reports ($10, in-person only) -- explicitly "ONLY AVAILABLE in-person ... or by written request," no bulk CSV/database product. `ocassessor.gov/page/property-information-and-parcel-maps` doesn't run its own search at all -- it hands off to ParcelQuest (already known: paywalled owner field, Cloudflare Turnstile gate). `assessedvalue.ocassessor.gov` was already confirmed in August to withhold owner name even on a known-APN lookup, by law. `taxbill.octreasurer.gov` was already confirmed to be a heavy client-rendered SPA with no name-search, a bill-validation tool not a roll source.
+
+**`data-ocpw.opendata.arcgis.com` is real and open but the wrong department.** Pulled its full DCAT catalog (33 datasets, all OC PUBLIC WORKS: traffic collisions, flood zones, watersheds, zoning, roads, aerial imagery, an unclaimed-property list). Zero parcel-ownership or assessor datasets -- Public Works' open-data program never touched the Assessor's roll. Zoning/land-use layers here could still be useful later for a property-type (single/multi-family) cross-check, but not for owner data.
+
+**`webapps.ocgis.com/oclandinsights` -- unconfirmed, connection refused to a plain fetch** (`ECONNREFUSED`), consistent with every other OC government site in this project that needs Scrapfly's residential proxy to even load. Not yet testable until Scrapfly quota clears.
+
+**The one real, actionable path found: California's Public Records Act, filed through the county's own portal.** `ocgov.com/.../request-public-records` documents `orangecounty.nextrequest.com` ("NextRequest") as the live CPRA request system covering 18 departments including Assessor, Clerk-Recorder, and Treasurer-Tax Collector -- electronic records are free, the department must respond within 10 (extendable to 14) calendar days. This is NOT automatable and not instant, but it is the legitimate route to ask the Assessor directly for a bulk roll extract (owner name, mailing address, assessed value, property class) -- something CA's owner-name-search BLOCK on the live lookup tools does not necessarily prevent when requested as a formal records request rather than a live search. Worth filing if this segment is a priority, since every automated path above dead-ends at the same statutory wall.
+
+**Bottom line: the Senior Homeowner / Absentee Landlord / Out-of-State Landlord gap is still open.** No free, scrapeable bulk source exists for Orange County the way it does for the Ohio counties in the Sphere-of-Influence pipeline. The only forward path identified today is a manual CPRA request (10-14 day turnaround, unknown cost for a bulk extract, needs a human to file it) -- not a script that can run today.
+
+## Orange County CA foreclosure pipeline: pull + address resolve, PAUSED mid-batch (2026-09-03)
+
+Built on top of the RecorderWorks fix above. `src/occa_recorder_pull.py` pulls raw NT TRUSTEE SALE rows (resumable by explicit `--pages`, since `search.OnPage(N)` can jump straight to any page without visiting the ones before it -- cheap to resume, no need to re-read pages already saved). `src/occa_foreclosure_address_resolve.py` resolves a property address per record. `src/occa_foreclosure_property_filter.py` is written but BLOCKED (below). No upload has happened yet for this batch -- paused by Ty pending tomorrow's continuation.
+
+**Confirmed live: the 367-result cap is a real display ceiling, not a coincidence.** A 6-month AND a 12-month query both returned exactly 367; a 1-month query (Aug 1 - Sep 3) returned its true, uncapped count of 80. Default sort is newest-first, so a capped query silently drops the OLDER end of the range. Anything wider than ~4-5 months needs month-by-month partitioning (same fix already used for the TN 1000-row cap) to avoid silent truncation -- not yet built, since today's pull stayed inside one uncapped month.
+
+**Pulled 80 real records (the complete Aug 1 - Sep 3 window, not capped).** Newest 9/1/2026. Saved to `output/occa_foreclosure_pull_20260903.json`.
+
+**The Recorder's per-record DETAIL VIEW carries NO address, APN, or legal description -- confirmed live, not assumed.** Called `detailsContainer.getDetails()` directly (same direct-call trick as the search fix) and inspected the real `DetailsPresentor.aspx` response: it has document number, page count, recording date, document type, and Grantor/Grantee names -- nothing else. The actual legal description only exists on the scanned document image, gated behind the site's purchase/cart flow (real per-page cost, same as the Assessor's roll pages). So address resolution has to go through the OWNER'S NAME, exactly like the probate pipeline already does.
+
+**Grantor names are indexed `LAST FIRST [MIDDLE]`, the OPPOSITE convention from a notice body** (`GUERRERO GERMAN` = last Guerrero, first German) -- confirmed by testing both orders live. Getting this backwards silently mis-searches every name.
+
+**The Grantor field mixes the foreclosure trustee company with the actual owner, same field, no role marker.** `split_grantors()` (in `occa_foreclosure_address_resolve.py`) filters on business-entity keywords (LLC, INC, CORP, SERVICES, TITLE, DEFAULT, RECON, LENDER, "&", etc.) rather than the trailing "TR" suffix alone, because an individual owner can legitimately carry their own "TR" too (they hold title via a personal living trust, e.g. "RICHARDS JAMES ROBERT TR" is a real homeowner, not the sale trustee). Dry-run on the 80: 70 records carry a real individual owner name, 10 are pure entity/LLC ownership (no person to search -- would need a BusinessV2 lookup, out of scope today).
+
+**Confidence, adapted from the probate pattern but with different signals** (no date-of-death, no personal-representative graph -- this isn't probate): high = 2+ owner names on the same record independently resolve to the SAME Orange County address (spousal corroboration, same trick as the Ohio SOI household-pair boost); medium = one name, unambiguous (only one same-named OC resident); low = one name, but multiple same-named OC residents exist (a coin flip). **Live result: 66 of 80 resolved (82.5%) -- 7 high, 28 medium, 31 low, 14 unresolved** (10 entity-only + 4 individual names with no OC address on file). Saved to `output/occa_foreclosure_pull_20260903_resolved.json`.
+
+**A real parsing bug caught and fixed the same run, without needing to re-pay Enformion.** Enformion's `fullAddress` format is `"STREET[, UNIT]; CITY, STATE ZIP"` (semicolon before the city) -- the exact same format `occa_address_resolve.py` already handles correctly for probate. The first version of the foreclosure resolver used a comma-based regex instead, which matched at the comma before an apartment/unit and glued the unit onto the city (`"Apt B; Santa Ana"` as a garbage city). Fixed the regex to split on the semicolon like the probate script does, then repaired the 66 already-resolved records in place by re-splitting the saved (corrupted) `resolved_address` string -- no new Enformion calls needed, since the raw data was still there, just mis-sliced.
+
+**BLOCKER: the OpenWeb Ninja Zillow API subscription is inactive account-wide, confirmed live.** Property-type filtering (Single/Multi Family only, per Ty's requirement) needs a live property lookup -- the Deal Room `_api` SiftMap client used by `buyer_sweep.py`/`comp_package.py` lives on a different machine's checkout and isn't present on this workstation, so `occa_foreclosure_property_filter.py` reuses `property_enricher._fetch_property()` (same `OPENWEBNINJA_API_KEY`, no extra dependency) instead. Both `property-details-address` AND `/search` 403 with `"You are not subscribed to this API"` on a totally unrelated test address -- not a bad-address problem, an account/billing problem. **This blocks more than today's task**: `property_enricher.py`, `zillow_market_api.py`, and everything built on it (`comp_package.py`, `buyer_sweep.py`, `deal_analyzer.py`) share this same key and are equally blocked until the subscription is renewed.
+
+**BATCH COMPLETE 2026-09-04.** OpenWeb Ninja subscription confirmed active (verified live before spending anything further). `occa_foreclosure_property_filter.py` on the 66 resolved records kept **39 qualifying** (Single Family + Multi-Family/Apartment) and dropped 27 (12 condo, 4 townhouse, 1 manufactured, 1 vacant land, 9 no Zillow data -- a handful of those 9 hit a transient 503 on both retries, worth a re-try pass later). `src/occa_foreclosure_datasift_prep.py` built the upload CSV, `datasift_api_upload.py` uploaded (verify-one-first caught a real bug before it touched more than 1 record, see below), `datasift_add_tag.py --tag "Priority 2"` tagged all 39, `slack_notifier.send_batch_summary()` reported the batch to the existing `GOOGLE_CHAT_WEBHOOK_URL` space. **Final: 39 records live on the `Foreclosure` list, all tagged Priority 2, 0 failed.** A 4-record random audit read back 4/4 correct (owner name, list, tag) -- and incidentally showed DataSift's own enrichment had already added `Tired Landlord` and `Free & Clear` to one record on top, unprompted, the same multi-list-arrives-free behaviour documented elsewhere in this file.
+
+**A real bug caught by the verify-one-record-first habit, again.** `occa_foreclosure_datasift_prep.py`'s first version split `resolved_via_name` as "FIRST LAST" -- but that field carries the Recorder's own Grantor-field order verbatim, "LAST FIRST" (the same convention `occa_foreclosure_address_resolve.py._split_name` already had to account for). The very first uploaded record (2026000247324) went out as First=Guerrero, Last=German instead of the correct First=German, Last=Guerrero. Fixed in the prep script, and the one already-created test record was repaired in place with a direct `PATCH /api/internal/property/{uuid}/` of just the `owner` object (confirmed live: this route works and returns the full record back, a useful general-purpose fix path beyond add-tags/custom-field/notes, which were the only PATCH/POST routes previously exercised) -- no re-upload needed.
+
+**Set aside, not done today:** the 10 entity/LLC-owned records (need an Enformion BusinessV2 officer lookup, a path not yet used in this pipeline) and the 4 individual owners with no Orange County address on file at all (would need a different skip-trace source for a small handful of records). Both deferred as a judgment call rather than blocking the 39 that were ready.
+
+## ENRICH + SKIP TRACE IS PART OF THE PULL, NOT AN OPTIONAL EXTRA (2026-09-04)
+
+**Cyrus's rule: every First-to-Market pull gets DataSift's Enrich Property Data AND Skip Trace run on it right after import, and the batch notification says whether that happened.** (Ty, the original author, handed this codebase off weeks earlier and is largely out of the day-to-day picture now — see "Identity note" at the end of this section. Standing rules dated on or after the handoff are Cyrus's, even in entries elsewhere in this file still phrased as "Ty's rule" out of habit.) The 43 probate and 39 foreclosure records both went live WITHOUT phones because `datasift_api_upload.py` is a pure data-upload script -- it has no enrich or skip-trace call anywhere in it, and the only code that ever did was `datasift_uploader.py`'s browser path, which the OC pipelines never used. Verified live at the time: `owner.phones == []` on the uploaded records. A record with an address and no phone is not callable, so the pull was not actually finished.
+
+**There is no API for this. `run_enrich_lists.py`'s docstring already explains why** (`/api/internal/property/enrich/` answers an empty POST with a count of EVERY property in the account and its trigger contract is unknown, so guessing risks running owner enrichment account-wide). It is the browser path or nothing. New runner: **`src/run_enrich_skiptrace_by_tags.py`**, plus `tags=` support added to `enrich_records()` / `skip_trace_records()` and a new `_filter_by_tags()`.
+
+**SCOPE BY TAG, NOT BY LIST.** `enrich_records(list_name=...)` scopes to a whole shared list, and "Foreclosure" holds every foreclosure record in the account including Tennessee's -- `FTM` is likewise generic (`datasift_formatter._build_tags` puts it on every TN record too). The batch-specific tag is `pulled_<date>`, so one pull is `FTM + <type> + pulled_<date>`. **A failed tag filter now ABORTS instead of continuing**, because the old "continue anyway -- may enrich whatever is showing" fallback means selecting the unfiltered default view, i.e. everything.
+
+**Five real bugs, four of them in code that had been "working", all found by reading screenshots rather than logs:**
+- **`_select_all_records` only ever selected the VISIBLE PAGE (10 rows).** Its own docstring said so. Enrich and skip trace both ran on 10 of 39 records and reported success. The fix is the checkbox dropdown's **`Select all (N)`** option -- note the wording: the SiftMap page says `Select Max (N)` and `add_siftmap_records` looks for that, but the Records page says `Select all (N)`, so a search for "Select Max" here silently finds nothing and falls back to page one. Click the CARET on the right of the container, not its centre (the centre is the checkbox). **The (N) in that label is now the run's own scope check** -- the foreclosure pass logging `Select all (38)` is what proves it is not operating on 10 or on 2,200.
+- **The login "session restored from cookies" check raced the app's own auth validation.** The SPA renders `/records/properties`, the check passes, and only then does it bounce to `/?next=%2Frecords%2Fproperties` -- which contains the URL-ENCODED path, so `"/records" in url` is False while `"/login" not in url` is True. Every downstream step then ran against the login page and failed with nonsense ("No Filter Records link found"). Now `_looks_authenticated()` rejects `next=`/`signout` and is checked TWICE, seconds apart, on both the cookie and fresh-login paths.
+- **Modal content loads behind a spinner**, so an instant `.count()` for "I Agree with the terms" reads exactly like the button not existing. A screenshot taken at that moment showed only a spinner. `_wait_for_visible()` polls instead.
+- **The submit button is genuinely blocked by the tag-suggestion chip rendered on top of it** ("intercepts pointer events"). The fix is a JS-click fallback, NOT dismissing the chip first: pressing Escape and clicking the page body were both tried and **both closed the entire Skip Trace modal**, since Escape is a generic close-dialog shortcut and the body is outside the dialog.
+- **A fuzzy `get_by_text(tag, exact=False)` fallback matched "SiftMap" for the tag "FTM"** (SiftMap contains the substring "ftM") and spent 30s trying to click a hidden element. Exact match only; a tag that never appears must stay a clean failure rather than silently clicking something else.
+
+**Live result:** foreclosure `Select all (38)` enrich + skip trace OK; probate `Select all (42)` enrich + skip trace OK. Sampled read-back on the foreclosure batch: 2-4 phones, 1-5 emails, `skiptraced=True`, beds/sqft populated. **38 and 42, against 39 and 43 uploaded** -- one record per batch is missing from the default **Clean** tab (Records splits Clean / Incomplete / All), which is worth confirming before treating a per-pull count as complete.
+
+## First-to-Market: reusable run prompt + non-technical teammate runbook (2026-09-04)
+
+Everything above this point in the Orange County thread was learned the hard way, one bug at a time, across several sessions. This section is the payoff: a prompt that bakes every one of those lessons in, so the NEXT county/state/notice-type expansion (or just the next routine OC pull) doesn't have to rediscover them. Two versions exist because two different audiences run this — Cyrus in Claude Code, and his non-technical teammates covering for him.
+
+**Identity note, load-bearing for how this file reads going forward.** `CLAUDE.md`'s constant "Ty's rule" / "Ty, <date>:" citations are historical — Ty is the original author and domain expert who built this whole codebase, then **handed it off several weeks before 2026-09-04 and is now mostly out of the picture** (he pushes the occasional update, nothing more). **Cyrus is the one actually operating Claude Code day to day since the handoff, running the pipelines, and pushing the commits** — his own words: "I do the daily work now and moving forward." Practical effect: Cyrus is the escalation contact for his own team (not Ty), and any entry timestamped after the handoff that reads "Ty's rule" is really Cyrus's rule, carried forward in the file's established voice out of habit rather than re-attributed. Don't read a "Ty" citation as meaning Ty needs to be looped in on anything operational now.
+
+**The technical prompt (Claude Code, any county/state/notice-type):**
+```
+I need to pull new First-to-Market leads.
+
+Area: [county, state]
+Target notice types: [e.g. Foreclosure, Probate, Pre-Probate, Tax Delinquent]
+Filters (best-effort, drop any that don't apply and tell me which): [e.g. Free & Clear, Vacant, Senior Homeowner, Absentee/Out-of-State Owner]
+Buy box: [property type(s), price range]
+Priority tag to apply: [e.g. Priority 2]
+Target record count: [N] (or "everything available in [window]")
+
+Follow this sequence, don't skip or reorder, and pause with a status update
+rather than silently degrading if any step is blocked:
+
+1. SOURCE CHECK -- confirm which source actually covers each requested
+   notice type in this geography before pulling. A pattern proven in one
+   state does not transfer to another (TN's open tax-name-search does not
+   exist in CA; CA forecloses through the Recorder, never a court docket).
+   If a notice type has no known working source, say so, don't substitute.
+2. PULL RAW RECORDS -- respect any site-side result/display cap (partition
+   by month if a wide range silently truncates). Dedupe by case/instrument
+   number, not by publication (records republish under new IDs). Confirm
+   geography with a structural signal (case-number pattern, source field,
+   courthouse location), never a bare city-name or newspaper-name match.
+3. CLASSIFY ON NOTICE BODY TEXT against known INCLUDE/EXCLUDE anchor
+   phrases -- not the source's own category taxonomy or newspaper name,
+   both unreliable. Drop anything with a sale date already passed. Drop
+   vacant land / no-address records if the buy box requires a structure.
+4. RESOLVE PROPERTY ADDRESS when the notice doesn't carry one. Get the
+   source's name-order convention right (Recorder Grantor fields often run
+   "LAST FIRST", opposite of notice-body order) -- verify, don't assume.
+   Separate entity/trustee names from individual owners (an owner can
+   legitimately carry their own "TR" suffix for a personal living trust).
+   Rank multiple candidates only on evidence that discriminates between
+   them, never a fact equally true of all of them. Watch for state-name
+   collisions, PO boxes (mailing, not property), and a low results-per-page
+   default hiding the right match on a common name. Every address ships
+   with a confidence tier and a "must verify" note.
+5. VERIFY THIRD-PARTY APIS ARE LIVE before trusting a "zero results" --
+   fire one throwaway known-good call and check the status code. A lapsed
+   subscription returns a clean empty/403 that looks exactly like no data.
+6. PROPERTY-TYPE FILTER against the buy box using a live lookup. Log what
+   was dropped and why.
+7. BUILD THE UPLOAD FILE using the project's real tag-building logic, never
+   hand-typed tags. Canonical DataSift lists only (Foreclosure, Probate,
+   Pre-Foreclosure, etc.) -- never a dated per-pull list. Batch
+   traceability is tags: pulled_<date> + notice-type + FTM + priority tag.
+8. UPLOAD ONE RECORD FIRST, read it back (name order, address, tags,
+   lists, custom fields), only then release the rest of the file.
+9. APPLY THE PRIORITY TAG to the full uploaded batch.
+10. ENRICH + SKIP TRACE -- MANDATORY:
+    python src/run_enrich_skiptrace_by_tags.py --tags "FTM,<type>,pulled_<date>"
+    Scope by TAG, never list name (lists/FTM/type tags are account-wide).
+    Confirm the "Select all (N)" log line matches the real batch size.
+    Wait a few minutes, then spot-check phones/emails on 3-5 records.
+11. SET ASIDE, DON'T SILENTLY DROP anything that couldn't be fully
+    processed (entity owner, no address, low confidence) -- list it with
+    a reason.
+12. NOTIFY -- one Google Chat batch-completion message: pulled -> resolved
+    -> filtered -> uploaded -> tagged -> enrich/skip-trace status (real
+    counts) -> deferred records and why. Route to this pipeline's own
+    webhook env var, never the default.
+
+Report real counts at each stage, not just a final total.
+```
+
+**The non-technical teammate version (Claude Code app, SiftStack folder open -- NOT the plain claude.ai chat, which cannot execute anything here):**
+```
+Area: [county, state]
+Type of leads: [plain English, e.g. "houses in foreclosure"]
+Nice-to-have filters (skip any that don't apply): [plain English]
+Property type: [e.g. "regular houses and small multi-unit buildings only"]
+Tag to add: [e.g. "Priority 2"]
+How many: [a number, or "however many are available in the last X months"]
+
+Run the full First-to-Market workflow end to end -- pulling the leads,
+finding property addresses where missing, filtering to the right property
+type, uploading to DataSift, tagging them, and running Enrich + Skip Trace
+so the leads actually have phone numbers. Do not skip skip-trace -- that's
+the difference between a usable lead and a name with no way to contact them.
+
+Give me a plain-English summary at the end with real numbers: how many
+were found, how many got a good address, how many made it through the
+property filter, how many were uploaded, and how many now have phone
+numbers.
+```
+Expect a step-down sequence of numbers (e.g. "80 found -> 66 got an address -> 39 qualified -> 39 uploaded -> 39 have phone numbers") -- that's normal, not every lead survives every step. **Stop, hold the batch, and message Cyrus** (not Ty -- see identity note above) on: "not subscribed"/"subscription lapsed", "0 records" from a source that's supposed to work, "could not select records" or a "select all" count mismatch, any login/credential/rate-limit error, or any technical question the teammate doesn't understand. If Cyrus is genuinely unreachable, leave the batch where it is rather than re-running or forcing it through -- a half-finished unverified batch in DataSift is worse than a delayed one.
+
 ## Output CSVs auto-upload to Google Drive (build 1.0.45, 2026-09-02)
 
 Every pull pipeline now saves its CSV to the Drive folder "FTM DataSift Backup of Output CSVs" with no flag to remember. `src/drive_autoupload.py` is the shared best-effort helper (a Drive outage must never lose a pull that cost real scrape time and Enformion spend); `--no-drive` or `SIFTSTACK_NO_DRIVE=1` opts out, and `python src/drive_autoupload.py` is a standalone credential check that verifies the folder is reachable without uploading. Hooked into `data_formatter.write_csv` (which covers **every** `main.py` CLI pull in one place), `knox_ftm_pull`, `consolidate_foreclosures`, and the two `occa_*` scripts. The Apify branch is guarded off, since it does its own Drive upload.
