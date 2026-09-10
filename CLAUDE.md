@@ -236,7 +236,7 @@ Ty supplied nine URLs and asked whether these were already added — seven were 
 
 **Tax Sale (a future notice type, not foreclosure).** `octreasurer.gov/taxauction` (tax-defaulted property auctions) and `taxbill.octreasurer.gov` (per-parcel bill lookup, confirmed to be a heavy client-rendered SPA that needs a scripted form-fill) — both identified, neither automated yet.
 
-**Pre-probate (owner died, no court filing yet) — still an open gap.** None of these nine cover it; all nine are court, recorder, or tax-collector sites, and pre-probate by definition has no filing yet to find at any of them. It needs an obituary-style source, which has not been identified for Orange County.
+**Pre-probate (owner died, no court filing yet) — was an open gap, RESOLVED 2026-09-11 by pivoting to Obituaries.** None of these nine cover it; all nine are court, recorder, or tax-collector sites, and pre-probate by definition has no filing yet to find at any of them. It needed an obituary-style source, which none of these nine were. See "Orange County CA obituary pipeline" below -- an obituary is itself the trigger (a family may want to sell before or during probate), so the pull targets obituaries directly instead of waiting for a filing that pre-probate by definition doesn't have yet.
 
 ## Orange County CA property/tax-roll source map (2026-09-03) — for Senior Homeowner / Absentee Landlord / Out-of-State Landlord
 
@@ -286,6 +286,8 @@ Built on top of the RecorderWorks fix above. `src/occa_recorder_pull.py` pulls r
 
 **SCOPE BY TAG, NOT BY LIST.** `enrich_records(list_name=...)` scopes to a whole shared list, and "Foreclosure" holds every foreclosure record in the account including Tennessee's -- `FTM` is likewise generic (`datasift_formatter._build_tags` puts it on every TN record too). The batch-specific tag is `pulled_<date>`, so one pull is `FTM + <type> + pulled_<date>`. **A failed tag filter now ABORTS instead of continuing**, because the old "continue anyway -- may enrich whatever is showing" fallback means selecting the unfiltered default view, i.e. everything.
 
+**`pulled_<date>` IS NOT ACTUALLY UNIQUE ACROSS PIPELINES, AND THIS SILENTLY FIRED SKIP TRACE ACCOUNT-WIDE (2026-09-09).** `knox_ftm_pull.py` stamps the exact same `pulled_<run_date>` tag convention as the OC pipeline's prep scripts (`occa_datasift_prep.py` / `occa_foreclosure_datasift_prep.py`) -- both borrowed the same idea independently. Scoping a run to `FTM,probate,pulled_2026-09-09` on a day both Orange County AND Knox/Blount had records land under that exact tag triple did NOT fail closed the way a missing tag does -- the filter genuinely applied (3 real tag pills, "Applied tag filters" logged correctly) and matched every record account-wide carrying all three, not just the 2 intended. `Select all (1,848)` was the tell (the log line existed for exactly this reason, see below) but by the time it printed, skip trace had already been clicked against that scope -- Enrich aborted cleanly first (a tag search timing miss on the same run, unrelated bug) which is the only reason this was caught before Enrich also ran wide. **No dollar cost from this specific mistake** (skip trace is the flat $97/mo unlimited plan, not metered per record), but it re-processed ~1,848 unrelated records that did not need it and could just as easily have been a metered action. **The actual fix: don't trust FTM + notice-type + pulled_date to be batch-unique just because it usually is.** Mint a single genuinely-unique tag per batch (`datasift_add_tag.py --tag "occa_batch_<date>_<type>" --create`) and scope enrich/skip-trace to that ONE tag instead of a multi-tag AND combination assembled from generic pieces. Always read the `Select all (N)` count against the batch's own known size before trusting the run -- a wildly-off N (in either direction) is the abort signal this whole mechanism exists to give you.
+
 **Five real bugs, four of them in code that had been "working", all found by reading screenshots rather than logs:**
 - **`_select_all_records` only ever selected the VISIBLE PAGE (10 rows).** Its own docstring said so. Enrich and skip trace both ran on 10 of 39 records and reported success. The fix is the checkbox dropdown's **`Select all (N)`** option -- note the wording: the SiftMap page says `Select Max (N)` and `add_siftmap_records` looks for that, but the Records page says `Select all (N)`, so a search for "Select Max" here silently finds nothing and falls back to page one. Click the CARET on the right of the container, not its centre (the centre is the checkbox). **The (N) in that label is now the run's own scope check** -- the foreclosure pass logging `Select all (38)` is what proves it is not operating on 10 or on 2,200.
 - **The login "session restored from cookies" check raced the app's own auth validation.** The SPA renders `/records/properties`, the check passes, and only then does it bounce to `/?next=%2Frecords%2Fproperties` -- which contains the URL-ENCODED path, so `"/records" in url` is False while `"/login" not in url` is True. Every downstream step then ran against the login page and failed with nonsense ("No Filter Records link found"). Now `_looks_authenticated()` rejects `next=`/`signout` and is checked TWICE, seconds apart, on both the cookie and fresh-login paths.
@@ -294,6 +296,30 @@ Built on top of the RecorderWorks fix above. `src/occa_recorder_pull.py` pulls r
 - **A fuzzy `get_by_text(tag, exact=False)` fallback matched "SiftMap" for the tag "FTM"** (SiftMap contains the substring "ftM") and spent 30s trying to click a hidden element. Exact match only; a tag that never appears must stay a clean failure rather than silently clicking something else.
 
 **Live result:** foreclosure `Select all (38)` enrich + skip trace OK; probate `Select all (42)` enrich + skip trace OK. Sampled read-back on the foreclosure batch: 2-4 phones, 1-5 emails, `skiptraced=True`, beds/sqft populated. **38 and 42, against 39 and 43 uploaded** -- one record per batch is missing from the default **Clean** tab (Records splits Clean / Incomplete / All), which is worth confirming before treating a per-pull count as complete.
+
+## Orange County CA obituary pipeline (2026-09-11)
+
+Pivoted from "Pre-Probate" to "Obituaries" as the notice type after confirming, again, that no source exists for a CA death before a court filing -- an obituary IS the trigger event a family may act on, so this pull targets obituaries directly. `src/occa_obituary_pull.py` (new) is deliberately built around a **pluggable source registry** -- each source is one `fetch_fn(frm, to) -> list[dict]` function appended to a `SOURCES` list, so adding a new source later means writing one function, not touching the pipeline. `--sources key1,key2` restricts a run to specific sources for testing a new one in isolation.
+
+**Tested 12 candidate URLs live before building anything** (a real SOURCE CHECK, not a guess) -- full per-URL results below. Two work today, wired in; a third is real but not wired in yet.
+
+**Sources that work:**
+- **OC Register (`ocregister.com`)** -- the county's own paper. NOT scraped HTML: it runs on a discoverable **WordPress REST API**, `/wp-json/wp/v2/obituary` (a custom post type, `wp-json/wp/v2/types` lists it), with clean server-side `after`/`before` date filtering and normal pagination (`X-WP-TotalPages` header) -- exactly the kind of precise date-window control the earlier capublicnotice.com/RecorderWorks pulls had to fight hard for, free here. Plain HTTP, no CAPTCHA, no Cloudflare. **BUT it is the whole SCNG regional network's obituary feed, not an OC-only one** -- confirmed live, the raw feed for one week included Idaho Falls ID, Sarasota FL, Bend OR, Raleigh NC entries alongside real OC ones. Same class of leaky-filter problem this project has hit before (capublicnotices.com's county dropdown, Dignity Memorial's groupcode below) -- client-side filtering against a real OC city allowlist (`OC_CITIES`, 34 incorporated cities + notable unincorporated communities) is mandatory, never trust the source's own scoping. City/state is **not a clean API field** -- there's no location field in the JSON at all -- so it's recovered from the URL **slug**, which this vendor's own system appends as `<slugified-name>-<city>-<state-abbr>` (confirmed live: `mark-w-erickson-orange-ca` -> Orange, CA; `david-paul-saltzer-tustin-ca` -> Tustin, CA), with a prose regex fallback (`"... of Anaheim, California ..."` or a literal "Orange County" phrase) for the handful of records where the slug heuristic doesn't cleanly strip the name prefix.
+- **Hilgenfeld Mortuary** -- a real, independent Orange County funeral home. Also WordPress, also has a working REST API, but the custom post type slug is **`obituaries` (plural)**, not `obituary` like OC Register -- checking one vendor's naming and assuming it holds for the next WP-based mortuary site wastes a call. Same `after`/`before` filtering works. The list endpoint returns **blank `content`** for every row (confirmed live, not a fetch bug), so each candidate's own page has to be fetched separately for body text -- cheap here since the volume for one week off one small mortuary is naturally small. Because it's a single OC-area mortuary, every record from it is treated as Orange-County-plausible rather than confirmed (`city_confirmed=False` in the output) -- flag, don't assert, same discipline already used elsewhere in this project for low-confidence signals.
+
+**Source tested and found real, but NOT wired in yet: Dignity Memorial.** A plain `requests` fetch gets a flat 403 on the search page AND on the plain homepage -- real bot protection (Akamai/PerimeterX-class), not a UA-string problem; headers alone don't clear it. **Scrapfly (`asp=True, render_js=True, residential`) does clear it** (confirmed live, 200/198KB of real rendered content). Once rendered, though: **the `?groupcode=santa-ana-ca` URL param does NOT actually filter results** -- confirmed live, a "Santa Ana" groupcode search returned Nashville TN, Winder GA, and Apopka FL entries in the same result set. This is the exact same shape of bug capublicnotices.com's county dropdown had (and Dignity Memorial's OWN per-city mortuary pages, e.g. Fairhaven/Peek Family, are real and OC-scoped -- it's specifically the search page's groupcode param that leaks). The page is a Next.js app; its initial data lives in a `<script id="__NEXT_DATA__">` JSON blob at `props.pageProps.obitsInit` (clean structured records: name, dates, city/state, full obituary text, link -- better shaped than OC Register's, if it could be filtered), and `props.pageProps.filters.creationDate` confirms the site DOES support a real `last7days`/`last30days` server-side date filter once the actual (client-rendered) search call is found -- that would make this the best-dated of the three sources. Reverse-engineering that real API call is the next step for whoever picks this up; not done today, in scope but out of budget for this session. Left commented out in `SOURCES` (not deleted) with this pointer in the code.
+
+**Checked and rejected, same live-test pass:** Legacy.com and Ever Loved both 403 (Cloudflare) to a plain fetch, same class of block as Dignity Memorial -- Scrapfly would likely clear them too, not tried. Echovita's listed URL is a dead 404. LA Times / Daily Pilot are reachable but wrong content type (editorial "notable death" news articles, not a classified obituary feed) and not OC-scoped. Forest Lawn's obituary search spans LA/Orange/Riverside counties together with no clean OC-only filter found. O'Connor Mortuary and Fairhaven's own page are both real but empty at the moment tested, and both route into the Dignity Memorial network anyway. CDNC (California Digital Newspaper Collection) 403s and is a historical OCR archive with real digitization lag regardless -- wrong tool even unblocked. OC Public Library is a research portal with no exposed obituary index. Shannon Family Mortuary (Orange, CA) is real and live but not deeply tested -- a candidate for a future addition.
+
+**Address resolution reuses `occa_address_resolve.py` UNCHANGED** -- zero new resolver code needed. Its `resolve_one()` only ever reads `decedent_name` / `personal_representative` / `date_published` / `raw_excerpt` off a dict, and the obituary pull's `ObitRecord` dataclass deliberately uses those exact field names so the existing Enformion decedent-address engine just works against obituary output. Same for `occa_foreclosure_property_filter.py` -- fully generic already (reads `resolved_address`/`resolved_city`/`resolved_zip`, writes `property_type`), reused as-is for the Single/Multi-Family filter. This is the payoff of the shared-field-name convention: a third notice type needed one new pull script and one new prep script, not a new resolver or filter.
+
+**EVERY OBITUARY-SOURCED ADDRESS IS STRUCTURALLY LOW CONFIDENCE, and that is expected, not a bug.** Confirmed live on the first real run (6 records, Sept 5-9 2026 window): all 6 resolved "low", zero medium or high -- a first for this project, every prior batch had a real confidence mix. The reason is structural, not a data quality problem: `candidate_rank()`'s two +5-point discriminators are a date-of-death match and the personal representative appearing in the candidate's Enformion relatives graph -- an obituary has no PR (no filing exists yet) and Enformion's death-index coverage is sparse (documented elsewhere in this file as ~1 in 25 candidates), so neither signal is usually available this early. Every record still gets an address (venue-match plus "N same-named people in the county" is a real, just weaker, signal) and ships tagged `address_low_confidence` + `address_needs_verify`, same convention as any other low-confidence row in this project. **Do not read an all-low-confidence obituary batch as a broken pipeline** -- it is the honest result of pulling this early, and the fix is verifying before mailing, not re-running.
+
+**`occa_obituary_datasift_prep.py` (new) mirrors the foreclosure prep script's shape.** Canonical list `Obituary` (confirmed present in the account already, see the Drive-upload section above). The contact is the decedent directly (no owner-vs-PR or owner-vs-trustee split at this stage) and `decedent_name` is already in normal First..Last order -- unlike the Recorder's reversed "Last First" convention foreclosure records need to account for, so the name split here is the simple case, not the trap. Every row's Notes states explicitly that the free & clear / vacant / senior owner / absentee owner filters were NOT applied (no automated OC source for any of them, confirmed again this session -- same CPRA-request-only conclusion as the 2026-09-03 property/tax-roll source map above), rather than silently omitting the fact that they were requested.
+
+**One real, still-open API gap found finishing the upload: DataSift's "Notice Type" select field has no "obituary" option.** `datasift_schema_bootstrap.py` created that field back in August with the 7 canonical TN notice types (`foreclosure`, `tax_sale`, ... `divorce`) as its only options, and the upload's own "never guess a select value" rule correctly skipped it rather than inventing a UUID -- a clean, silent, non-fatal skip, exactly as designed. Tried two ways to add the missing option live: `POST /api/internal/custom-fields/{uuid}/options/` (a guessed sub-resource route) 404s; `PATCH /api/internal/custom-fields/{uuid}/` (matching the pattern used to CREATE fields) also 404s, even with/without a trailing slash. The real update route for an EXISTING select field's options was not found this session -- worth a few more minutes for whoever needs the dropdown to actually show "obituary" (the record itself is still correctly identified via its list, tags, and Notes in the meantime, so this is cosmetic, not a data-loss gap).
+
+**Live result, first real pull (Sept 5-9, 2026 window): 7 raw obituaries -> 6 confirmed Orange County -> 6 resolved to an address (all low confidence) -> 4 passed the Single/Multi-Family filter -> 4 uploaded, tagged Priority 2, skip traced.** 2 of the 4 uploaded records got full SiftMap property enrichment (beds/baths/sqft); the other 2 (both apartment-unit addresses) came back blank on those fields -- not an error, SiftMap just doesn't carry full detail on those specific units. All 4 came back `skiptraced=True` with 3-5 phones and 5 emails each.
 
 ## First-to-Market: reusable run prompt + non-technical teammate runbook (2026-09-04)
 
@@ -306,7 +332,7 @@ Everything above this point in the Orange County thread was learned the hard way
 I need to pull new First-to-Market leads.
 
 Area: [county, state]
-Target notice types: [e.g. Foreclosure, Probate, Pre-Probate, Tax Delinquent]
+Target notice types: [e.g. Foreclosure, Probate, Obituaries, Tax Delinquent]
 Filters (best-effort, drop any that don't apply and tell me which): [e.g. Free & Clear, Vacant, Senior Homeowner, Absentee/Out-of-State Owner]
 Buy box: [property type(s), price range]
 Priority tag to apply: [e.g. Priority 2]
@@ -352,9 +378,18 @@ rather than silently degrading if any step is blocked:
    lists, custom fields), only then release the rest of the file.
 9. APPLY THE PRIORITY TAG to the full uploaded batch.
 10. ENRICH + SKIP TRACE -- MANDATORY:
-    python src/run_enrich_skiptrace_by_tags.py --tags "FTM,<type>,pulled_<date>"
-    Scope by TAG, never list name (lists/FTM/type tags are account-wide).
-    Confirm the "Select all (N)" log line matches the real batch size.
+    python src/datasift_add_tag.py --csv <file> --tag "batch_<date>_<type>" --create --commit
+    python src/run_enrich_skiptrace_by_tags.py --tags "batch_<date>_<type>"
+    Scope by a freshly-created, genuinely unique batch tag -- NOT by list name
+    and NOT by an "FTM,<type>,pulled_<date>" combination. That combination
+    looks batch-specific but is not: Knox/Blount's own pull stamps the exact
+    same pulled_<date> convention, so on any day both pipelines land records
+    of the same notice type, that filter silently matches BOTH accounts'
+    records, not just this one (caught live 2026-09-09, ran skip trace
+    against ~1,848 unrelated records before it was noticed). A one-off
+    tag minted for this batch alone cannot collide with another pipeline.
+    Confirm the "Select all (N)" log line matches the real batch size --
+    an N wildly larger (or smaller) than the batch is the abort signal.
     Wait a few minutes, then spot-check phones/emails on 3-5 records.
 11. SET ASIDE, DON'T SILENTLY DROP anything that couldn't be fully
     processed (entity owner, no address, low confidence) -- list it with
@@ -831,6 +866,80 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 
 **Retired (kept only as a v4 reference):** `src/enformion_heir.py` / `scripts/enformion_person_search.py`. Failure modes for the record: zero relatives half the time, no phones on the graph, ~50-relative cap that silently truncates, a surname gate that drops married-out daughters, `isDeceased` flags that lag reality, and wrong-person matches when anchored on city/ZIP instead of the full street line.
 
+### Deep Prospecting v5: reusable run prompt for a non-technical teammate (2026-09-05)
+
+Same idea as the First-to-Market master prompt above (`reference_ftm_master_prompt`): every gotcha in the section above was found the hard way, one bug or one near-miss at a time (the spouse-obituary trap chief among them — it would have had a caller ask a recent widow for her dead husband). This prompt bakes all of them in as mandatory steps, so a teammate covering for Cyrus while he's out doesn't have to rediscover any of them.
+
+**Run this in the Claude Code app (Mac/Windows desktop app or CLI), with the SiftStack folder open — NOT the plain claude.ai chat, which has no access to this codebase or its API keys and cannot actually run anything.** If unsure which one is open, check for a file tree / terminal on the left — that's Claude Code.
+
+```
+I need to deep prospect a record — figure out who to actually call because the
+owner may be deceased (or otherwise hard to reach), and get their contact info.
+
+Record: [property address, city, county, state, zip]
+Owner / decedent name (as it appears on the notice or CRM record): [name]
+Notice type: [probate / foreclosure / tax delinquent / etc.]
+Anything already known from the filing: [e.g. named executor/personal
+representative, co-owner, notice publish date]
+
+Follow this sequence in order. Do not skip a step, and do not silently
+substitute a guess for a step that comes back empty — say so and stop instead:
+
+1. OWNER-MATCH CHECK FIRST, before treating this as an heir case at all.
+   Confirm the person who died is actually the OWNER OF RECORD on this
+   property, not a spouse, parent, or other relative. An obituary showing up
+   on a record does not by itself mean the owner died — it is common for it
+   to be the owner's late husband or wife instead, in which case the real
+   owner is still alive and this is a normal living-owner call, not an heir
+   search. Get this wrong and the call opens by asking a living widow about
+   her own obituary.
+2. RUN SMARTSKIP on the owner/decedent's name to pull relatives AND their
+   phone numbers in one pass.
+3. GAP-FILL ANY MISSING PHONES — if a relative came back with a name but no
+   phone number, run the secondary lookup (Tracerfy) to try to fill it in.
+4. NEVER TRUST THE SOURCE'S OWN "DECEASED" FLAG OR ITS "RELATIONSHIP" LABEL
+   AS FINAL. That flag is frequently wrong even for a confirmed, obituary-
+   documented death, and the relationship label is usually a generic
+   placeholder ("Relative"), not the real relationship. Confirm the actual
+   date of death and the real relationship yourself via a published
+   obituary or other public web research — this step is mandatory, not
+   optional, and it costs nothing.
+5. SANITY-CHECK THE DATE OF DEATH against when this notice was filed or
+   published — they should be within a few years of each other. If the DOD
+   you find is much older than the notice, that is a sign you may have
+   matched the wrong person with the same name; flag it rather than
+   accepting it.
+6. IF THE OWNER IS A BUSINESS, LLC, OR TRUST — not a person — do not run a
+   personal name search on it, that costs money and returns nothing. Set it
+   aside and flag it for a business-entity lookup instead.
+7. SCORE EVERY PHONE NUMBER that comes back so it's clear which to dial
+   first, second, third, and which to not bother calling at all.
+8. WATCH FOR SHARED HOUSEHOLD NUMBERS — if a phone number the search labels
+   as belonging to a "relative" is actually a number the living owner
+   themselves also uses, that number belongs to the owner, not to a special
+   contact; label it plainly as the owner's own number.
+9. DELIVER ONE CLEAN SUMMARY: who died (if anyone actually did), who the
+   real person to call is and why (the evidence, in plain terms), every
+   phone number found ranked by call priority, and a one-line flag on
+   anything that isn't fully certain and should be double-checked by a
+   human before calling.
+10. IF ANY STEP COMES BACK EMPTY, A LOOKUP SERVICE FAILS, OR SOMETHING
+    LOOKS OFF (login/credential error, an account that's supposed to work
+    returning nothing, a name that won't resolve) — STOP and say so
+    plainly rather than guessing or quietly moving on. If you can't get
+    unblocked, message Cyrus (not Ty — he's out of the day-to-day picture)
+    and leave the record as-is rather than forcing it through.
+
+Rough cost is about $0.24 per record — fine to run one at a time or in small
+batches, but check with Cyrus before running this against a large batch of
+records at once.
+
+Give me a plain-English summary at the end: who to call, the number to try
+first, and anything you're not fully sure about.
+```
+
+Expect the summary to name a clear person and a ranked phone list on a clean case, and to say plainly "still alive, not an heir case" on a spouse-obituary case rather than forcing a heir search that doesn't apply. **Stop and message Cyrus** on: a lookup service returning an error or "not subscribed", a record where the death date and the notice date are years apart with no explanation, an owner that turns out to be a business/LLC with no person to search, or any credential/login failure. A half-verified contact going out to a caller is worse than a delayed one.
+
 ---
 
 ### Legacy: Deceased-Owner Heir Resolution — Enformion (v4, superseded by v5 above)
@@ -1030,6 +1139,12 @@ python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" -
 
 # Output: JSON file in output/market_finder_{state}_{county}_{timestamp}.json
 ```
+
+**State/County select is fixed by `.fill()` breaking the site's own filter, confirmed live on a Florida/Palm Beach County pull (2026-09-10).** Both the `sift-market-research` skill's bundled copy (`.claude/skills/sift-market-research/scripts/`) and this project's `src/extract_market_finder.py` drive `_select_state`/`_select_county` with `locator.fill(text)` -- that sets the whole value in one JS-dispatched event and the "Select States"/"Select Counties" `InputMultiSearch` dropdown never re-filters off it, showing "No options found" even for a query that plainly matches ("Florida" typed via `.fill()` or even via `press_sequentially(delay=150)` both failed live). **A SINGLE real keystroke reliably works** (confirmed via a live DOM dump: typing "F" alone populated California / District of Columbia / Florida -- a plain case-insensitive substring filter over the full state/county list the page already loaded). The site's own debounce appears to race on anything faster/more-batched than one real keystroke at a time. Fix used successfully: click the input, clear it, then type ONE character, wait ~700ms, check for the exact-text option (`[class*="InputMultiSearchLabel"]:text-is("Florida")`), and only type an additional character if it hasn't appeared yet -- never commit more keystrokes than the minimum needed. Also: a `[class*="MarketFinderLoader"]` overlay intercepts the input click while the page's initial data is still loading -- wait for it to hit `state="hidden"` before clicking, with a `force=True` click as a last resort.
+
+**The skill's bundled `datasift_core.py` is a separate, staler fork of `src/datasift_core.py` -- do not assume the two behave the same.** The skill copy's `login()` still does a single `wait_for_url("**/dashboard/general**", timeout=15000)` and misreads a slower post-login redirect as a failure (confirmed live: a screenshot taken right after the reported failure showed a fully authenticated account mid-render). `src/datasift_core.py` already has the fix documented elsewhere in this file (`_looks_authenticated()`, checked twice, seconds apart) -- when a Market Finder pull is misbehaving on login or navigation, prefer running `src/extract_market_finder.py` over the skill's own copy in `.claude/skills/`, since the skill ZIP is a distribution snapshot that has drifted behind this project's own hardening.
+
+**The skill's `get_credentials()` / `python-dotenv` call can silently fail to find this project's `.env` depending on where the calling code lives.** `load_dotenv()` with no path argument walks up from the CALLING FILE's own directory, not the process's cwd, when it can resolve a caller frame. Called from the skill's bundled `datasift_core.py` (under `.claude/skills/sift-market-research/scripts/`), it walks up through `.claude/skills/...` and never reaches `E:\OneDrive\Desktop\SiftStack\.env`, raising "DATASIFT_EMAIL and DATASIFT_PASSWORD must be set" even though the project's `.env` has them. Fix: `load_dotenv(r"E:\OneDrive\Desktop\SiftStack\.env")` with an explicit path, called before importing/using anything that reads credentials. `src/extract_market_finder.py` doesn't have this problem since it and `.env` are both under the project root.
 
 ## REI Skill Library (18 Skills)
 

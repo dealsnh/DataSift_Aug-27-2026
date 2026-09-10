@@ -391,6 +391,10 @@ def disqualify(rec: Notice, today: datetime) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Orange County CA FTM pull (foreclosure + probate)")
     ap.add_argument("--months", type=int, default=3, help="lookback window in months")
+    ap.add_argument("--from-date", dest="from_date", default="",
+                    help="MM/DD/YYYY, overrides --months for the window start")
+    ap.add_argument("--to-date", dest="to_date", default="",
+                    help="MM/DD/YYYY, overrides today as the window end")
     ap.add_argument("--limit", type=int, default=15, help="max qualified records to keep")
     ap.add_argument("--types", default="foreclosure,probate")
     ap.add_argument("--county", default="Orange")
@@ -406,8 +410,8 @@ def main() -> int:
 
     want = {t.strip().lower() for t in args.types.split(",") if t.strip()}
     today = datetime.now()
-    last = today.strftime("%m/%d/%Y")
-    first = (today - timedelta(days=31 * args.months)).strftime("%m/%d/%Y")
+    last = args.to_date or today.strftime("%m/%d/%Y")
+    first = args.from_date or (today - timedelta(days=31 * args.months)).strftime("%m/%d/%Y")
 
     print(f"Orange County CA first-to-market pull")
     print(f"  source : {BASE}  (county filter authoritative via row .location)")
@@ -544,7 +548,7 @@ def main() -> int:
              "qualified": len(qualified),
              "kept": len(keep)},
             warnings=([f"{len(dropped)} disqualified "
-                       f"(stale auction date or no street address)"] if dropped else None)
+                       f"(stale auction date or no street address)"] if dropped else [])
             + ([] if keep else ["ZERO records kept - check the source"]),
         )
     except Exception as e:                      # noqa: BLE001
